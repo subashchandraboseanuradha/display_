@@ -1,0 +1,19 @@
+# Arduino / ESP32 build artifacts
+build/
+bin/
+*.o
+*.elf
+*.bin
+
+# SquareLine / Cache
+cache/
+backup/
+
+# Local settings
+.claude/
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
