@@ -33,6 +33,7 @@
 #include "i2s_mic.h"
 #include "deepgram.h"
 #include "camera.h"
+#include "dictionary.h"
 #include "secrets.h"
 
 extern "C" uint32_t ui_get_millis()            { return millis(); }
@@ -49,6 +50,13 @@ extern "C" void     ui_log_event_v(const char*, ...) {}
 #define CAMERA_VIEW   6
 #define PHOTO_GALLERY 7
 #define PHOTO_DETAIL  8
+#define WIFI_PANEL    9
+#define DICT_KB      10   // keyboard input
+#define DICT_LISTEN  11   // recording word (voice mode)
+#define DICT_FETCH   12   // fetching definition
+#define DICT_RESULT  13   // showing result
+#define WORD_LIST    14   // saved vocabulary list
+#define WORD_DETAIL  15   // full word definition
 static int      s_state = IDLE;
 static uint32_t s_timer = 0;
 
@@ -57,13 +65,19 @@ static uint32_t s_timer = 0;
 #define PREVIEW_CHARS   22   // chars shown per note in list
 
 static int  s_note_count   = 0;
-static int  s_note_counter = 0;       // next note number to write
+static int  s_note_counter = 0;
+static int  s_word_count   = 0;       // saved vocabulary words
+static int  s_word_counter = 0;       // next word file number
 static int  s_scroll_top   = 0;       // first visible note (0 = newest)
-static int  s_detail_rank  = 0;       // which rank to show in detail (0=newest)
+static int  s_detail_rank    = 0;     // which rank to show in detail (0=newest)
+static bool s_delete_pending = false; // waiting for second tap to confirm delete
 static char s_transcript[640];
 
 // Preview cache: rank 0 = newest note, rank 1 = second newest, …
 static char s_previews[MAX_NOTES_CACHE][PREVIEW_CHARS + 1];
+// Word list cache: stores just the word (first line of file, before \n)
+#define MAX_WORDS_CACHE 80
+static char s_word_previews[MAX_WORDS_CACHE][24]; // word + part-of-speech preview
 
 // ── Touch ─────────────────────────────────────────────────────────────────────
 #define T_NONE        0
@@ -231,6 +245,38 @@ void uiNotesList() {
 
 // ── Display: Screen 2 — note detail ──────────────────────────────────────────
 
+// Returns y position after last line drawn (for chaining content below)
+static int drawWrappedTextEx(const char* text, int x, int y_start, int w, uint16_t colour) {
+    const int max_y = 197;  // stop before footer zone
+    tft.setTextFont(2);
+    tft.setTextColor(colour, TFT_BLACK);
+    tft.setTextWrap(false);
+    const int LINE_H = 18, CHAR_W = 8;
+    int max_chars = w / CHAR_W;
+    char line[64];
+    const char* p = text;
+    int cy = y_start;
+    while (*p && cy + LINE_H <= max_y) {
+        int n = 0;
+        while (p[n] && p[n] != '\n' && n < max_chars) n++;
+        if (p[n] && p[n] != '\n' && n == max_chars) {
+            int bp = n; while (bp > 0 && p[bp] != ' ') bp--;
+            if (bp > 0) n = bp;
+        }
+        strncpy(line, p, n); line[n] = '\0';
+        tft.setCursor(x, cy); tft.print(line);
+        cy += LINE_H;
+        p += n;
+        if (*p == ' ' || *p == '\n') p++;
+    }
+    if (*p && cy > y_start) {
+        tft.setCursor(x + w - 20, cy - LINE_H);
+        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.print("...");
+    }
+    return cy;
+}
+
 static void drawWrappedText(const char* text, int x, int y_start, int w, int max_y) {
     tft.setTextFont(2);
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
@@ -279,13 +325,8 @@ void uiNoteDetail(int rank, const char* text) {
     tft.drawCentreString(hdr, 120, 11, 2);
     tft.drawFastHLine(30, 27, 180, TFT_CYAN);
 
-    // Full text
-    drawWrappedText(text, 35, 34, 170, 200);
-
-    // Footer
-    tft.setTextFont(1);
-    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-    tft.drawCentreString("tap = back to list", 120, 220, 1);
+    drawWrappedText(text, 35, 34, 170, 197);
+    uiDetailFooter();
 }
 
 // ── Display: Screen 3 — camera ───────────────────────────────────────────────
@@ -385,8 +426,348 @@ void uiPhotoDetailOverlay(int num, int total) {
     snprintf(buf, sizeof(buf), " PHOTO %d / %d ", num, total);
     tft.setCursor(2, 2);
     tft.print(buf);
-    tft.setCursor(2, 228);
-    tft.print(" tap = back ");
+    // Footer within circle safe zone
+    tft.drawFastHLine(40, 203, 160, 0x2104);
+    tft.setTextColor(TFT_WHITE);
+    tft.setCursor(44, 210); tft.print("< BACK");
+    tft.setTextColor(TFT_RED);
+    tft.setCursor(148, 210); tft.print("[ DELETE ]");
+}
+
+// ── Display: WiFi panel ───────────────────────────────────────────────────────
+// Saved networks from secrets.h
+static const char* SAVED_SSIDS[] = { WIFI_SSID_1, WIFI_SSID_2, WIFI_SSID_3 };
+static const char* SAVED_PASS[]  = { WIFI_PASS_1, WIFI_PASS_2, WIFI_PASS_3 };
+static const int   SAVED_COUNT   = 3;
+
+// Scan result: SSIDs found nearby that match saved credentials
+static char  s_scan_ssid[3][33] = {};
+static int   s_scan_match[3]    = { -1, -1, -1 }; // index into SAVED_SSIDS, -1=no match
+static int   s_scan_count       = 0;
+static bool  s_scan_done        = false;
+static int   s_prev_state       = IDLE;  // state to return to when closing panel
+
+void uiWifiPanel(bool scanning) {
+    tft.fillScreen(TFT_BLACK);
+
+    // Header
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawCentreString("WiFi Settings", 120, 10, 2);
+    tft.drawFastHLine(25, 26, 190, TFT_WHITE);
+
+    // Current status
+    bool connected = (WiFi.status() == WL_CONNECTED);
+    tft.setTextFont(1);
+    if (connected) {
+        tft.setTextColor(TFT_GREEN, TFT_BLACK);
+        tft.drawCentreString(WiFi.SSID().c_str(), 120, 32, 2);
+        char ipbuf[20];
+        WiFi.localIP().toString().toCharArray(ipbuf, sizeof(ipbuf));
+        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.drawCentreString(ipbuf, 120, 50, 1);
+    } else {
+        tft.setTextColor(TFT_RED, TFT_BLACK);
+        tft.drawCentreString("Not connected", 120, 38, 2);
+    }
+
+    tft.drawFastHLine(25, 62, 190, 0x2104);
+
+    if (scanning) {
+        tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+        tft.drawCentreString("Scanning...", 120, 108, 2);
+        return;
+    }
+
+    // Saved networks — show match status
+    tft.setTextFont(2);
+    int y = 70;
+    for (int i = 0; i < SAVED_COUNT; i++) {
+        if (strlen(SAVED_SSIDS[i]) == 0) continue;
+        bool in_range   = false;
+        bool is_current = connected && (WiFi.SSID() == String(SAVED_SSIDS[i]));
+        // Check scan results
+        for (int j = 0; j < s_scan_count; j++) {
+            if (strcmp(s_scan_ssid[j], SAVED_SSIDS[i]) == 0) { in_range = true; break; }
+        }
+        if (is_current) {
+            tft.setTextColor(TFT_GREEN, TFT_BLACK);
+            tft.drawString("✓ ", 30, y);
+        } else if (in_range) {
+            tft.setTextColor(TFT_WHITE, TFT_BLACK);
+            tft.drawString("→ ", 30, y);
+        } else {
+            tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+            tft.drawString("✗ ", 30, y);
+        }
+        // Truncate SSID to fit
+        char ssid_short[22];
+        strncpy(ssid_short, SAVED_SSIDS[i], 21);
+        ssid_short[21] = '\0';
+        tft.drawString(ssid_short, 50, y);
+        if (!is_current && in_range) {
+            tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+            tft.setTextFont(1);
+            tft.drawString("tap to connect", 50, y + 17);
+            tft.setTextFont(2);
+            y += 36;
+        } else {
+            y += 26;
+        }
+    }
+
+    if (s_scan_count == 0 && s_scan_done) {
+        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.drawCentreString("No saved networks in range", 120, 140, 1);
+        tft.drawCentreString("Add SSIDs to secrets.h", 120, 155, 1);
+    }
+
+    tft.drawFastHLine(25, 195, 190, 0x2104);
+    tft.setTextFont(1);
+    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    tft.drawCentreString("tap = connect  |  swipe up = close", 120, 201, 1);
+    tft.drawCentreString("New network? Add to secrets.h", 120, 215, 1);
+}
+
+// ── Display: Dictionary keyboard ─────────────────────────────────────────────
+// Circle safe zone: at y=44 width≈196px, at y=194 width≈176px, at y=202 width≈166px
+// Letter grid:  5 cols × 36px = 180px  x=30..210  y=40..190  (5 rows × 30px)
+// Special row:  5 keys × 33px = 165px  x=37..202  y=194..224
+
+#define KB_LX  30    // letter grid left
+#define KB_LY  40    // letter grid top
+#define KB_CW  36    // col width
+#define KB_RH  30    // row height
+#define KB_SX  37    // special row left (narrower for circle)
+#define KB_SY 194    // special row top
+#define KB_SW  33    // special key width
+#define KB_SH  28    // special row height
+
+static char s_kb_input[32] = {0};
+static int  s_kb_len = 0;
+
+static const char KB_ALPHA[5][5] = {
+    {'A','B','C','D','E'},
+    {'F','G','H','I','J'},
+    {'K','L','M','N','O'},
+    {'P','Q','R','S','T'},
+    {'U','V','W','X','Y'}
+};
+
+static void drawKey(int x, int y, int w, int h,
+                    const char* lbl, uint16_t bg, uint16_t fg, uint8_t fnt=2) {
+    tft.fillRoundRect(x+2, y+2, w-4, h-4, 4, bg);
+    tft.setTextColor(fg, bg);
+    int ty = y + (h - (fnt==2 ? 16 : 8)) / 2;
+    tft.drawCentreString(lbl, x + w/2, ty, fnt);
+}
+
+void uiDictKeyboard() {
+    tft.fillScreen(TFT_BLACK);
+
+    // Input bar y=5..37 (x=22..218 safe at top of circle)
+    tft.fillRoundRect(22, 5, 196, 30, 6, 0x2104);
+    tft.setTextColor(TFT_WHITE, 0x2104);
+    char disp[36];
+    snprintf(disp, sizeof(disp), s_kb_len ? "%s|" : "type a word...", s_kb_input);
+    tft.drawCentreString(disp, 120, 12, 2);
+
+    // Letters A-Y (rows 0-4, cols 0-4)
+    for (int r = 0; r < 5; r++) {
+        for (int c = 0; c < 5; c++) {
+            char lbl[2] = {KB_ALPHA[r][c], '\0'};
+            drawKey(KB_LX + c*KB_CW, KB_LY + r*KB_RH, KB_CW, KB_RH,
+                    lbl, 0x4208, TFT_WHITE, 2);
+        }
+    }
+
+    // Special row: Z < ___ MIC GO  (x=37..202 fits inside circle at y=194-222)
+    drawKey(KB_SX + 0*KB_SW, KB_SY, KB_SW, KB_SH, "Z",   0x4208, TFT_WHITE,   2);
+    drawKey(KB_SX + 1*KB_SW, KB_SY, KB_SW, KB_SH, "<",   0x632C, TFT_WHITE,   2);
+    drawKey(KB_SX + 2*KB_SW, KB_SY, KB_SW, KB_SH, "___", 0x3186, 0x7BEF,      1);
+    drawKey(KB_SX + 3*KB_SW, KB_SY, KB_SW, KB_SH, "MIC", 0x0010, TFT_WHITE,   1);
+    drawKey(KB_SX + 4*KB_SW, KB_SY, KB_SW, KB_SH, "GO",  TFT_BLUE, TFT_WHITE, 1);
+}
+
+// Returns: 0=nothing, 1=redraw, 2=search/GO, 3=voice/MIC
+int kb_tap(int tap_x, int tap_y) {
+    // Special row
+    if (tap_y >= KB_SY) {
+        int col = (tap_x - KB_SX) / KB_SW;
+        if (col < 0 || col > 4) return 0;
+        switch (col) {
+            case 0: if (s_kb_len<30){s_kb_input[s_kb_len++]='Z';s_kb_input[s_kb_len]=0;} return 1;
+            case 1: if (s_kb_len>0) s_kb_input[--s_kb_len]=0; return 1;
+            case 2: if (s_kb_len<30){s_kb_input[s_kb_len++]=' ';s_kb_input[s_kb_len]=0;} return 1;
+            case 3: return 3;
+            case 4: return 2;
+        }
+    }
+    // Letter grid
+    if (tap_y < KB_LY) return 0;
+    int row = (tap_y - KB_LY) / KB_RH;
+    int col = (tap_x - KB_LX) / KB_CW;
+    if (row < 0 || row > 4 || col < 0 || col > 4) return 0;
+    if (s_kb_len < 30) {
+        s_kb_input[s_kb_len++] = KB_ALPHA[row][col];
+        s_kb_input[s_kb_len]   = '\0';
+    }
+    return 1;
+}
+
+void uiDictListening(uint32_t elapsed_ms) {
+    tft.fillScreen(TFT_BLACK);
+    tft.fillCircle(120, 100, 55, 0x0010);
+    tft.drawCircle(120, 100, 55, TFT_WHITE);
+    tft.fillRoundRect(111, 76, 18, 36, 9, TFT_WHITE);
+    tft.drawArc(120, 112, 22, 16, 180, 360, TFT_WHITE, TFT_BLACK);
+    tft.drawFastVLine(120, 128, 8, TFT_WHITE);
+    tft.drawFastHLine(110, 136, 20, TFT_WHITE);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawCentreString("LISTENING...", 120, 165, 2);
+    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    tft.drawCentreString("tap to stop", 120, 190, 2);
+    tft.drawCentreString("(say one word)", 120, 210, 1);
+}
+
+void uiDictResult(const char* definition, bool found, int rank = -1, int total = 0) {
+    tft.fillScreen(TFT_BLACK);
+    // Position indicator top-right: "2/5" when browsing saved words
+    if (total > 1 && rank >= 0) {
+        char pos_ind[12];
+        snprintf(pos_ind, sizeof(pos_ind), "%d/%d", rank + 1, total);
+        tft.setTextFont(1);
+        tft.setTextColor(0x39E7, TFT_BLACK);
+        tft.drawString(pos_ind, 195, 5);
+    }
+    if (!found) {
+        tft.setTextColor(TFT_RED, TFT_BLACK);
+        tft.drawCentreString("Word not found", 120, 95, 4);
+        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.drawCentreString("Check spelling", 120, 128, 2);
+        tft.drawCentreString("tap = try again", 120, 155, 2);
+        return;
+    }
+    // Parse: "WORD\n(pos)\ndef text\neg. example" (4 lines, last 2 optional)
+    char word[48]={0}, pos[32]={0}, def[200]={0}, eg[120]={0};
+    const char* nl1 = strchr(definition, '\n');
+    const char* nl2 = nl1 ? strchr(nl1+1, '\n') : nullptr;
+    const char* nl3 = nl2 ? strchr(nl2+1, '\n') : nullptr;
+    if (nl1) {
+        strncpy(word, definition, min((int)(nl1-definition), 47));
+        if (nl2) {
+            strncpy(pos, nl1+1, min((int)(nl2-nl1-1), 31));
+            if (nl3) {
+                strncpy(def, nl2+1, min((int)(nl3-nl2-1), 199));
+                strncpy(eg,  nl3+1, 119);
+            } else {
+                strncpy(def, nl2+1, 199);
+            }
+        }
+    }
+
+    // Header: WORD (large) + pos (small)
+    tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    char wup[48]; int wi=0;
+    for (; word[wi]; wi++) wup[wi]=toupper(word[wi]); wup[wi]='\0';
+    tft.drawCentreString(wup, 120, 10, 4);
+    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    tft.drawCentreString(pos, 120, 42, 2);
+    tft.drawFastHLine(28, 56, 184, TFT_CYAN);
+
+    // Definition in white
+    int def_bottom = drawWrappedTextEx(def, 28, 60, 184, TFT_WHITE);
+
+    // Example in dimmer colour if present
+    if (strlen(eg) > 0) {
+        tft.drawFastHLine(28, def_bottom + 2, 184, 0x2104);
+        drawWrappedTextEx(eg, 28, def_bottom + 6, 184, 0x7BEF); // dim grey
+    }
+
+    // Footer: within circle at y=210
+    tft.drawFastHLine(38, 203, 164, 0x2104);
+    tft.setTextFont(1);
+    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    tft.setCursor(42,  210); tft.print("tap=new");
+    tft.setTextColor(0xFD20, TFT_BLACK);
+    tft.setCursor(108, 210); tft.print("up=vocab");
+    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    tft.setCursor(168, 210); tft.print("dn=X");
+}
+
+void uiWordList(int scroll_top) {
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextColor(0xFD20, TFT_BLACK); // amber
+    char hdr[22];
+    snprintf(hdr, sizeof(hdr), "VOCAB (%d)", s_word_count);
+    tft.drawCentreString(hdr, 120, 9, 2);
+    if (scroll_top > 0) { tft.setTextColor(TFT_DARKGREY, TFT_BLACK); tft.drawCentreString("^", 215, 8, 2); }
+    tft.drawFastHLine(25, 23, 190, 0xFD20);
+
+    int visible = min(LIST_VISIBLE, s_word_count - scroll_top);
+    for (int i = 0; i < visible; i++) {
+        int rank = scroll_top + i;               // 0 = newest
+        int num  = s_word_count - rank;
+        int y    = LIST_START_Y + i * LIST_ITEM_H;
+        tft.setTextFont(1);
+        tft.setTextColor(0xFD20, TFT_BLACK);
+        char badge[8]; snprintf(badge, sizeof(badge), "#%d", num);
+        tft.drawString(badge, 35, y + 1);
+        tft.setTextFont(2);
+        tft.setTextColor(TFT_WHITE, TFT_BLACK);
+        tft.drawString(s_word_previews[rank], 58, y + 10);
+        if (i < visible - 1) tft.drawFastHLine(35, y + LIST_ITEM_H - 1, 170, 0x2104);
+    }
+    if (scroll_top + LIST_VISIBLE < s_word_count) {
+        tft.drawFastHLine(25, 196, 190, 0x2104);
+        tft.setTextFont(1); tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.drawCentreString("swipe up for more", 120, 202, 1);
+    }
+    tft.setTextFont(1); tft.setTextColor(0x2104, TFT_BLACK);
+    tft.drawCentreString("tap = detail  |  swipe right = close", 120, 218, 1);
+}
+
+void uiWordDetail(int rank, const char* definition) {
+    tft.fillScreen(TFT_BLACK);
+    // Parse WORD\n(pos)\ndef
+    char word[32]={0}, pos[24]={0}, def[300]={0};
+    const char* nl1 = strchr(definition, '\n');
+    const char* nl2 = nl1 ? strchr(nl1+1, '\n') : nullptr;
+    if (nl1) {
+        strncpy(word, definition, min((int)(nl1-definition), 31));
+        for (int i=0;word[i];i++) word[i]=toupper(word[i]);
+        if (nl2) {
+            strncpy(pos,  nl1+1, min((int)(nl2-nl1-1), 23));
+            strncpy(def,  nl2+1, 299);
+        }
+    }
+    tft.setTextColor(0xFD20, TFT_BLACK);
+    tft.drawCentreString(word, 120, 12, 4);
+    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    tft.drawCentreString(pos, 120, 42, 2);
+    tft.drawFastHLine(25, 57, 190, 0xFD20);
+    drawWrappedText(def, 30, 62, 180, 200);
+    uiDetailFooter();
+}
+
+// Shared footer for all detail screens — stays within circle at y=210 (x~40-200, 160px safe)
+// Tap zone: x<120 = BACK, x>120 = DELETE
+static void uiDetailFooter() {
+    tft.drawFastHLine(40, 203, 160, 0x2104);
+    tft.setTextFont(1);
+    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    tft.setCursor(44, 210); tft.print("< BACK");
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.setCursor(148, 210); tft.print("[ DELETE ]");
+}
+
+void uiDeleteConfirm(const char* label) {
+    // Overlay asking for second tap to confirm
+    tft.fillRoundRect(30, 85, 180, 70, 12, TFT_RED);
+    tft.setTextColor(TFT_WHITE, TFT_RED);
+    tft.drawCentreString("DELETE?", 120, 98, 4);
+    tft.setTextFont(1);
+    tft.drawCentreString(label, 120, 130, 1);
+    tft.drawCentreString("TAP AGAIN TO CONFIRM", 120, 145, 1);
 }
 
 // ── Notes: SD helpers ─────────────────────────────────────────────────────────
@@ -424,6 +805,169 @@ static void scanAndLoadNotes() {
     }
     Serial.printf("[NOTE] Found %d notes.\n", s_note_count);
     loadAllPreviews();
+}
+
+// Copy src → dst on SD (SD has no rename). Returns bytes written.
+static size_t sd_copy_file(const char* src, const char* dst) {
+    File s = SD.open(src, FILE_READ);
+    if (!s) return 0;
+    File d = SD.open(dst, FILE_WRITE);
+    if (!d) { s.close(); return 0; }
+    uint8_t buf[256];
+    size_t total = 0;
+    while (s.available()) {
+        int n = s.readBytes((char*)buf, sizeof(buf));
+        d.write(buf, n);
+        total += n;
+    }
+    s.close(); d.close();
+    return total;
+}
+
+// Delete note at rank (0=newest). Renumbers all files above it downward.
+static bool delete_note(int rank) {
+    int num = s_note_count - rank;
+    Serial.printf("[NOTE] Deleting note_%03d (rank %d of %d)\n", num, rank, s_note_count);
+    char path[24];
+    snprintf(path, sizeof(path), "/note_%03d.txt", num);
+    SD.remove(path);
+    // Shift note_NNN+1 → note_NNN for all files above
+    for (int i = num; i < s_note_count; i++) {
+        char from_p[24], to_p[24];
+        snprintf(from_p, sizeof(from_p), "/note_%03d.txt", i + 1);
+        snprintf(to_p,   sizeof(to_p),   "/note_%03d.txt", i);
+        sd_copy_file(from_p, to_p);
+        SD.remove(from_p);
+    }
+    s_note_count--;
+    s_note_counter--;
+    loadAllPreviews(); // refresh in-memory cache
+    Serial.printf("[NOTE] Deleted. %d notes remain.\n", s_note_count);
+    return true;
+}
+
+// Delete photo number num. Renumbers all photos above it downward.
+static bool delete_photo(int num) {
+    Serial.printf("[CAM] Deleting photo_%03d\n", num);
+    char path[28];
+    snprintf(path, sizeof(path), "/photo_%03d.jpg", num);
+    SD.remove(path);
+    for (int i = num; i < s_photo_count; i++) {
+        char from_p[28], to_p[28];
+        snprintf(from_p, sizeof(from_p), "/photo_%03d.jpg", i + 1);
+        snprintf(to_p,   sizeof(to_p),   "/photo_%03d.jpg", i);
+        sd_copy_file(from_p, to_p);
+        SD.remove(from_p);
+    }
+    s_photo_count--;
+    s_photo_counter--;
+    Serial.printf("[CAM] Deleted. %d photos remain.\n", s_photo_count);
+    return true;
+}
+
+// ── Word SD helpers ───────────────────────────────────────────────────────────
+
+static void loadWordPreviews() {
+    int cached = min(s_word_count, MAX_WORDS_CACHE);
+    for (int rank = 0; rank < cached; rank++) {
+        int num = s_word_count - rank;
+        char path[28]; snprintf(path, sizeof(path), "/word_%03d.txt", num);
+        File f = SD.open(path, FILE_READ);
+        if (f) {
+            // Read just enough for the preview (word + pos)
+            char buf[64] = {0};
+            f.readBytes(buf, 63);
+            f.close();
+            // Preview = "WORD (pos)"
+            const char* nl1 = strchr(buf, '\n');
+            const char* nl2 = nl1 ? strchr(nl1+1, '\n') : nullptr;
+            char word[20]={0}, pos[16]={0};
+            if (nl1) {
+                strncpy(word, buf, min((int)(nl1-buf), 19));
+                for (int i=0; word[i]; i++) word[i]=toupper(word[i]);
+                if (nl2) {
+                    // pos is "(noun)" etc — trim parens for brevity
+                    const char* pp = nl1+1;
+                    if (*pp=='(') pp++;
+                    strncpy(pos, pp, min((int)(nl2-nl1-2), 12));
+                }
+            } else { strncpy(word, buf, 19); }
+            snprintf(s_word_previews[rank], 24, "%-14s %s", word, pos);
+        } else {
+            snprintf(s_word_previews[rank], 24, "word_%03d", num);
+        }
+    }
+}
+
+static void scanAndLoadWords() {
+    Serial.println("[WORD] Scanning...");
+    s_word_count = 0;
+    for (int i = 1; i <= 999; i++) {
+        char p[28]; snprintf(p, sizeof(p), "/word_%03d.txt", i);
+        if (!SD.exists(p)) { s_word_counter = i-1; s_word_count = i-1; break; }
+        if (i == 999)       { s_word_counter = 999;  s_word_count = 999; }
+    }
+    Serial.printf("[WORD] %d words saved.\n", s_word_count);
+    loadWordPreviews();
+}
+
+static bool saveWord(const char* definition) {
+    s_word_counter++;
+    s_word_count++;
+    char path[28]; snprintf(path, sizeof(path), "/word_%03d.txt", s_word_counter);
+    File f = SD.open(path, FILE_WRITE);
+    if (!f) {
+        Serial.printf("[WORD] FAIL open %s\n", path);
+        s_word_counter--; s_word_count--;
+        return false;
+    }
+    f.print(definition);
+    f.close();
+    Serial.printf("[WORD] Saved %s\n", path);
+    // Add to preview cache (shift existing, insert at rank 0)
+    int cached = min(s_word_count, MAX_WORDS_CACHE);
+    for (int r = cached-1; r > 0; r--)
+        memcpy(s_word_previews[r], s_word_previews[r-1], 24);
+    // Build preview for new word
+    const char* nl1 = strchr(definition, '\n');
+    const char* nl2 = nl1 ? strchr(nl1+1, '\n') : nullptr;
+    char word[20]={0}, pos[12]={0};
+    if (nl1) {
+        strncpy(word, definition, min((int)(nl1-definition), 19));
+        for (int i=0;word[i];i++) word[i]=toupper(word[i]);
+        if (nl2) { const char* pp=nl1+1; if(*pp=='(')pp++; strncpy(pos,pp,min((int)(nl2-nl1-2),11)); }
+    }
+    snprintf(s_word_previews[0], 24, "%-14s %s", word, pos);
+    return true;
+}
+
+static bool loadWordText(int rank, char* buf, size_t max) {
+    int num = s_word_count - rank;
+    char path[28]; snprintf(path, sizeof(path), "/word_%03d.txt", num);
+    File f = SD.open(path, FILE_READ);
+    if (!f) return false;
+    size_t n = f.readBytes(buf, max-1);
+    buf[n] = '\0';
+    f.close();
+    return true;
+}
+
+static bool delete_word(int rank) {
+    int num = s_word_count - rank;
+    char path[28]; snprintf(path, sizeof(path), "/word_%03d.txt", num);
+    SD.remove(path);
+    for (int i = num; i < s_word_count; i++) {
+        char from_p[28], to_p[28];
+        snprintf(from_p, sizeof(from_p), "/word_%03d.txt", i+1);
+        snprintf(to_p,   sizeof(to_p),   "/word_%03d.txt", i);
+        sd_copy_file(from_p, to_p);
+        SD.remove(from_p);
+    }
+    s_word_count--;
+    s_word_counter--;
+    loadWordPreviews();
+    Serial.printf("[WORD] Deleted rank %d. %d remain.\n", rank, s_word_count);
+    return true;
 }
 
 static bool saveNote(int num, const char* text) {
@@ -512,7 +1056,8 @@ void setup() {
     }
     sd_reinit(tft.getSPIinstance());
     scanAndLoadNotes();
-    cam_scan_photos();   // count existing /photo_NNN.jpg files
+    cam_scan_photos();
+    scanAndLoadWords();
     sd_release();
 
     tft.setTextColor(TFT_GREEN, TFT_BLACK);
@@ -567,6 +1112,22 @@ void loop() {
                 bool cam_ok = cam_init();
                 s_state = CAMERA_VIEW;
                 uiCamera(cam_ok);
+            }
+            // Swipe up → Dictionary keyboard
+            if (tevt == T_SWIPE_UP && now - s_timer > 400) {
+                s_kb_len = 0; s_kb_input[0] = '\0';
+                s_state = DICT_KB;
+                s_timer = now;
+                uiDictKeyboard();
+            }
+            // Swipe down → WiFi panel
+            if (tevt == T_SWIPE_DOWN && now - s_timer > 400) {
+                s_prev_state = IDLE;
+                s_scan_done  = false;
+                s_scan_count = 0;
+                s_state = WIFI_PANEL;
+                uiWifiPanel(true);  // show "Scanning..."
+                s_timer = now;
             }
             break;
 
@@ -695,8 +1256,48 @@ void loop() {
         case NOTE_DETAIL:
             if (now - s_timer < 400) break;
 
-            if (tevt == T_TAP || tevt == T_SWIPE_RIGHT) {
-                // Back to list
+            if (tevt == T_TAP) {
+                int tap_x = (int)s_swipe_last_x;
+                int tap_y = (int)s_swipe_start_y;
+                bool tap_delete = (tap_x > 120 && tap_y > 200);
+
+                if (tap_delete) {
+                    if (!s_delete_pending) {
+                        // First tap on delete zone → show confirmation
+                        s_delete_pending = true;
+                        char label[32];
+                        snprintf(label, sizeof(label), "note_%03d.txt", s_note_count - s_detail_rank);
+                        uiDeleteConfirm(label);
+                        s_timer = now;
+                    } else {
+                        // Second tap = confirmed delete
+                        s_delete_pending = false;
+                        sd_reinit(tft.getSPIinstance());
+                        delete_note(s_detail_rank);
+                        sd_release();
+                        Serial.printf("[MAIN] Note deleted.\n");
+                        if (s_note_count == 0) {
+                            s_state = LIST_VIEW;
+                            uiNotesList();
+                        } else {
+                            if (s_detail_rank >= s_note_count) s_detail_rank = s_note_count - 1;
+                            sd_reinit(tft.getSPIinstance());
+                            loadNoteText(s_detail_rank, s_transcript, sizeof(s_transcript));
+                            sd_release();
+                            uiNoteDetail(s_detail_rank, s_transcript);
+                        }
+                        s_timer = now;
+                    }
+                } else {
+                    // Tap elsewhere = back to list (cancel any pending delete)
+                    s_delete_pending = false;
+                    s_state = LIST_VIEW;
+                    uiNotesList();
+                    s_timer = now;
+                }
+            }
+            else if (tevt == T_SWIPE_RIGHT) {
+                s_delete_pending = false;
                 s_state = LIST_VIEW;
                 uiNotesList();
                 s_timer = now;
@@ -731,14 +1332,57 @@ void loop() {
             break;
 
         // ── CAMERA_VIEW ───────────────────────────────────────────────────────
+        // UI layout:
+        //   Live preview fills screen
+        //   Bottom-left  (x<80,  y>185): [< FX >] filter cycle button
+        //   Bottom-centre (circle r=28 at 120,205): SHUTTER — only this captures
+        //   Bottom-right (x>180, y>185): back to IDLE
         case CAMERA_VIEW:
-            // Live preview: push RGB565 frame to TFT every iteration
+            // Live preview
             cam_preview_frame();
 
-            if (now - s_timer < 400) break;
+            // ── Overlay drawn on top of every frame ──────────────────────────
+            // Shutter button — large white circle, unmistakable
+            tft.fillCircle(120, 205, 26, TFT_WHITE);
+            tft.fillCircle(120, 205, 22, 0x8C51);   // inner grey ring
+            tft.fillCircle(120, 205, 18, TFT_WHITE); // white centre
+
+            // Filter button — left pill
+            tft.fillRoundRect(4, 191, 72, 22, 8, 0x2104);
+            tft.setTextFont(1);
+            tft.setTextColor(TFT_WHITE, 0x2104);
+            tft.drawCentreString(cam_filter_name(), 40, 196, 1);
+
+            // Back hint — right mini
+            tft.fillRoundRect(164, 191, 72, 22, 8, 0x2104);
+            tft.setTextColor(TFT_DARKGREY, 0x2104);
+            tft.drawCentreString("swipe >", 200, 196, 1);
+
+            if (now - s_timer < 350) break;
 
             if (tevt == T_TAP) {
-                // Capture photo
+                int tap_x = (int)s_swipe_last_x;
+                int tap_y = (int)s_swipe_start_y;
+
+                // Filter zone — left pill area
+                if (tap_x < 80 && tap_y > 185) {
+                    const char* fname = cam_next_filter();
+                    Serial.printf("[CAM] Filter: %s\n", fname);
+                    s_timer = now;
+                    break;
+                }
+
+                // Shutter zone — circle at (120, 205) radius 35
+                int dx = tap_x - 120, dy = tap_y - 205;
+                bool tap_shutter = (dx*dx + dy*dy) < (35*35);
+
+                if (!tap_shutter) {
+                    // Tap elsewhere = ignore (no accidental capture)
+                    s_timer = now;
+                    break;
+                }
+
+                // ── CAPTURE ──────────────────────────────────────────────────
                 uiStatus("Capturing...", nullptr, TFT_GREEN);
                 bool ok = cam_capture_save(tft.getSPIinstance());
                 if (ok) {
@@ -826,8 +1470,44 @@ void loop() {
         case PHOTO_DETAIL:
             if (now - s_timer < 400) break;
 
-            if (tevt == T_TAP || tevt == T_SWIPE_RIGHT) {
-                // Back to gallery
+            if (tevt == T_TAP) {
+                int tap_x = (int)s_swipe_last_x;
+                int tap_y = (int)s_swipe_start_y;
+                bool tap_delete = (tap_x > 120 && tap_y > 200);
+
+                if (tap_delete) {
+                    if (!s_delete_pending) {
+                        s_delete_pending = true;
+                        char label[32];
+                        snprintf(label, sizeof(label), "photo_%03d.jpg", s_detail_rank);
+                        uiDeleteConfirm(label);
+                        s_timer = now;
+                    } else {
+                        s_delete_pending = false;
+                        sd_reinit(tft.getSPIinstance());
+                        delete_photo(s_detail_rank);
+                        sd_release();
+                        Serial.printf("[MAIN] Photo deleted.\n");
+                        if (s_photo_count == 0) {
+                            s_state = PHOTO_GALLERY;
+                            uiPhotoGallery(0);
+                        } else {
+                            if (s_detail_rank > s_photo_count) s_detail_rank = s_photo_count;
+                            uiPhotoLoading(s_detail_rank);
+                            cam_view_photo(tft.getSPIinstance(), s_detail_rank);
+                            uiPhotoDetailOverlay(s_detail_rank, s_photo_count);
+                        }
+                        s_timer = now;
+                    }
+                } else {
+                    s_delete_pending = false;
+                    s_state = PHOTO_GALLERY;
+                    uiPhotoGallery(s_scroll_top);
+                    s_timer = now;
+                }
+            }
+            else if (tevt == T_SWIPE_RIGHT) {
+                s_delete_pending = false;
                 s_state = PHOTO_GALLERY;
                 uiPhotoGallery(s_scroll_top);
                 s_timer = now;
@@ -851,6 +1531,303 @@ void loop() {
                     uiPhotoDetailOverlay(s_detail_rank, s_photo_count);
                     s_timer = now;
                 }
+            }
+            break;
+
+        // ── WIFI_PANEL ────────────────────────────────────────────────────────
+        case WIFI_PANEL: {
+            // On entry: do one scan then display results
+            if (!s_scan_done) {
+                Serial.println("[WiFi] Scanning...");
+                int n = WiFi.scanNetworks(false, false); // blocking scan
+                s_scan_count = 0;
+                for (int i = 0; i < n && s_scan_count < 3; i++) {
+                    WiFi.SSID(i).toCharArray(s_scan_ssid[s_scan_count], 33);
+                    // Check if this SSID matches a saved network
+                    s_scan_match[s_scan_count] = -1;
+                    for (int j = 0; j < SAVED_COUNT; j++) {
+                        if (strlen(SAVED_SSIDS[j]) > 0 &&
+                            WiFi.SSID(i) == String(SAVED_SSIDS[j])) {
+                            s_scan_match[s_scan_count] = j;
+                            break;
+                        }
+                    }
+                    if (s_scan_match[s_scan_count] >= 0) s_scan_count++;
+                }
+                s_scan_done = true;
+                Serial.printf("[WiFi] Found %d matching networks\n", s_scan_count);
+                uiWifiPanel(false);
+                s_timer = now;
+                break;
+            }
+
+            if (now - s_timer < 300) break;
+
+            if (tevt == T_SWIPE_UP) {
+                // Close panel → return to previous screen
+                s_state = s_prev_state;
+                s_scan_done = false;
+                switch (s_prev_state) {
+                    case LIST_VIEW:    uiNotesList();         break;
+                    case PHOTO_GALLERY: uiPhotoGallery(s_scroll_top); break;
+                    default:           uiIdle();              break;
+                }
+                s_timer = now;
+            }
+            else if (tevt == T_TAP) {
+                // Tap on a network item → connect
+                int tap_y = (int)s_swipe_start_y;
+                // Items start at y=70, ~26px each
+                int item = (tap_y - 70) / 30;
+                if (item >= 0 && item < s_scan_count) {
+                    int saved_idx = s_scan_match[item];
+                    if (saved_idx >= 0 && strlen(SAVED_SSIDS[saved_idx]) > 0) {
+                        Serial.printf("[WiFi] Connecting to %s...\n", SAVED_SSIDS[saved_idx]);
+                        uiStatus("Connecting...", SAVED_SSIDS[saved_idx], TFT_YELLOW);
+                        WiFi.disconnect();
+                        WiFi.begin(SAVED_SSIDS[saved_idx], SAVED_PASS[saved_idx]);
+                        uint32_t t = millis();
+                        while (WiFi.status() != WL_CONNECTED && millis()-t < 12000) delay(300);
+                        if (WiFi.status() == WL_CONNECTED) {
+                            s_wifi_ok = true;
+                            Serial.printf("[WiFi] Connected: %s\n", WiFi.localIP().toString().c_str());
+                        } else {
+                            s_wifi_ok = false;
+                            Serial.println("[WiFi] Failed");
+                        }
+                        uiWifiPanel(false);
+                        s_timer = now;
+                    }
+                } else if (tap_y < 26) {
+                    // Tap header → close
+                    s_state = s_prev_state;
+                    s_scan_done = false;
+                    uiIdle();
+                    s_timer = now;
+                }
+            }
+            break;
+        }
+
+        // ── DICT_KB ───────────────────────────────────────────────────────────
+        case DICT_KB:
+            if (now - s_timer < 150) break;
+            if (tevt == T_SWIPE_DOWN) {
+                s_state = IDLE; uiIdle(); s_timer = now; break;
+            }
+            // Swipe left/right in keyboard = browse saved word history
+            if ((tevt == T_SWIPE_LEFT || tevt == T_SWIPE_RIGHT) && s_word_count > 0) {
+                if (tevt == T_SWIPE_LEFT) {
+                    s_detail_rank = 0;  // start from newest
+                } else {
+                    s_detail_rank = s_word_count - 1;  // start from oldest
+                }
+                sd_reinit(tft.getSPIinstance());
+                loadWordText(s_detail_rank, s_transcript, sizeof(s_transcript));
+                sd_release();
+                uiDictResult(s_transcript, true, s_detail_rank, s_word_count);
+                s_state = DICT_RESULT;
+                s_timer = now;
+                break;
+            }
+            if (tevt == T_TAP) {
+                int action = kb_tap((int)s_swipe_last_x, (int)s_swipe_start_y);
+                if (action == 1) {
+                    // Redraw keyboard with updated input
+                    uiDictKeyboard();
+                    s_timer = now;
+                } else if (action == 2) {
+                    // GO / Search
+                    if (s_kb_len > 0) {
+                        uiStatus("Looking up...", s_kb_input, TFT_CYAN);
+                        char word_buf[48];
+                        strncpy(word_buf, s_kb_input, 47); word_buf[47] = '\0';
+                        bool found = dict_lookup(word_buf, s_transcript, sizeof(s_transcript)-1);
+                        if (found) {
+                            // Auto-save to vocabulary
+                            sd_reinit(tft.getSPIinstance());
+                            saveWord(s_transcript);
+                            sd_release();
+                            s_detail_rank = 0; // new word is newest
+                        }
+                        uiDictResult(s_transcript, found, found ? 0 : -1, s_word_count);
+                        s_state = DICT_RESULT;
+                        s_timer = now;
+                    }
+                } else if (action == 3) {
+                    // MIC key → voice input mode
+                    if (start_i2s_recording()) {
+                        s_state = DICT_LISTEN;
+                        s_rec_start = s_ui_refresh = now;
+                        uiDictListening(0);
+                        s_timer = now;
+                    }
+                }
+            }
+            break;
+
+        // ── DICT_LISTEN ───────────────────────────────────────────────────────
+        case DICT_LISTEN:
+            if (now - s_ui_refresh > 800) {
+                s_ui_refresh = now;
+                uiDictListening(now - s_rec_start);
+            }
+            if ((tevt == T_TAP && now - s_timer > 800) || (now - s_rec_start > 4000)) {
+                stop_i2s_recording();
+                uiStatus("Transcribing...", nullptr, TFT_CYAN);
+                s_state = DICT_FETCH;
+                s_timer = now;
+            }
+            break;
+
+        // ── DICT_FETCH ────────────────────────────────────────────────────────
+        case DICT_FETCH:
+            if (!is_recording()) {
+                memset(s_transcript, 0, sizeof(s_transcript));
+                bool ok = deepgram_transcribe(
+                    get_audio_buffer(), get_audio_buffer_size(),
+                    s_transcript, sizeof(s_transcript) - 1);
+                if (ok && strlen(s_transcript) > 0) {
+                    Serial.printf("[DICT] Word heard: \"%s\"\n", s_transcript);
+                    uiStatus("Looking up...", s_transcript, TFT_CYAN);
+                    char word_buf[48];
+                    strncpy(word_buf, s_transcript, 47); word_buf[47] = '\0';
+                    bool found = dict_lookup(word_buf, s_transcript, sizeof(s_transcript) - 1);
+                    if (found) {
+                        sd_reinit(tft.getSPIinstance());
+                        saveWord(s_transcript);
+                        sd_release();
+                        s_detail_rank = 0;
+                    }
+                    uiDictResult(s_transcript, found, found ? 0 : -1, s_word_count);
+                } else {
+                    uiDictResult("", false, -1, 0);
+                }
+                s_state = DICT_RESULT;
+                s_timer = now;
+            }
+            break;
+
+        // ── DICT_RESULT ───────────────────────────────────────────────────────
+        case DICT_RESULT:
+            if (now - s_timer < 500) break;
+            if (tevt == T_TAP) {
+                s_kb_len = 0; s_kb_input[0] = '\0';
+                s_state = DICT_KB;
+                uiDictKeyboard();
+                s_timer = now;
+            }
+            // Swipe LEFT → older saved word (rank increases = further back in history)
+            else if (tevt == T_SWIPE_LEFT && s_word_count > 0 && s_detail_rank < s_word_count - 1) {
+                s_detail_rank++;
+                sd_reinit(tft.getSPIinstance());
+                loadWordText(s_detail_rank, s_transcript, sizeof(s_transcript));
+                sd_release();
+                uiDictResult(s_transcript, true, s_detail_rank, s_word_count);
+                s_timer = now;
+            }
+            // Swipe RIGHT → newer saved word (rank 0 = most recent)
+            else if (tevt == T_SWIPE_RIGHT && s_word_count > 0 && s_detail_rank > 0) {
+                s_detail_rank--;
+                sd_reinit(tft.getSPIinstance());
+                loadWordText(s_detail_rank, s_transcript, sizeof(s_transcript));
+                sd_release();
+                uiDictResult(s_transcript, true, s_detail_rank, s_word_count);
+                s_timer = now;
+            }
+            // Swipe RIGHT at newest (rank 0) → back to keyboard
+            else if (tevt == T_SWIPE_RIGHT) {
+                s_kb_len = 0; s_kb_input[0] = '\0';
+                s_state = DICT_KB;
+                uiDictKeyboard();
+                s_timer = now;
+            }
+            else if (tevt == T_SWIPE_UP && s_word_count > 0) {
+                // Open vocabulary list
+                s_scroll_top = 0;
+                s_state = WORD_LIST;
+                uiWordList(s_scroll_top);
+                s_timer = now;
+            }
+            else if (tevt == T_SWIPE_DOWN) {
+                s_state = IDLE; uiIdle(); s_timer = now;
+            }
+            break;
+
+        // ── WORD_LIST ─────────────────────────────────────────────────────────
+        case WORD_LIST:
+            if (now - s_timer < 300) break;
+            if (tevt == T_SWIPE_UP && s_scroll_top + LIST_VISIBLE < s_word_count) {
+                s_scroll_top++; uiWordList(s_scroll_top); s_timer = now;
+            }
+            else if (tevt == T_SWIPE_DOWN && s_scroll_top > 0) {
+                s_scroll_top--; uiWordList(s_scroll_top); s_timer = now;
+            }
+            else if (tevt == T_SWIPE_RIGHT) {
+                s_state = DICT_KB;
+                s_kb_len = 0; s_kb_input[0] = '\0';
+                uiDictKeyboard();
+                s_timer = now;
+            }
+            else if (tevt == T_TAP) {
+                int tap_y = (int)s_swipe_start_y;
+                int item  = (tap_y - LIST_START_Y) / LIST_ITEM_H;
+                int rank  = s_scroll_top + item;
+                if (item >= 0 && rank < s_word_count) {
+                    s_detail_rank = rank;
+                    sd_reinit(tft.getSPIinstance());
+                    loadWordText(rank, s_transcript, sizeof(s_transcript));
+                    sd_release();
+                    uiWordDetail(rank, s_transcript);
+                    s_state = WORD_DETAIL;
+                } else if (tap_y < 25) {
+                    s_state = DICT_KB;
+                    s_kb_len = 0; s_kb_input[0] = '\0';
+                    uiDictKeyboard();
+                }
+                s_timer = now;
+            }
+            break;
+
+        // ── WORD_DETAIL ───────────────────────────────────────────────────────
+        case WORD_DETAIL:
+            if (now - s_timer < 400) break;
+            if (tevt == T_TAP) {
+                int tap_x = (int)s_swipe_last_x;
+                int tap_y = (int)s_swipe_start_y;
+                if (tap_x > 120 && tap_y > 200) {
+                    // Delete zone
+                    if (!s_delete_pending) {
+                        s_delete_pending = true;
+                        char lbl[28]; snprintf(lbl, sizeof(lbl), "word_%03d.txt", s_word_count - s_detail_rank);
+                        uiDeleteConfirm(lbl);
+                    } else {
+                        s_delete_pending = false;
+                        sd_reinit(tft.getSPIinstance());
+                        delete_word(s_detail_rank);
+                        sd_release();
+                        if (s_word_count == 0) {
+                            s_state = DICT_KB;
+                            s_kb_len = 0; s_kb_input[0] = '\0';
+                            uiDictKeyboard();
+                        } else {
+                            if (s_detail_rank >= s_word_count) s_detail_rank = s_word_count-1;
+                            s_state = WORD_LIST;
+                            uiWordList(s_scroll_top);
+                        }
+                    }
+                } else {
+                    s_delete_pending = false;
+                    s_state = WORD_LIST;
+                    uiWordList(s_scroll_top);
+                }
+                s_timer = now;
+            }
+            else if (tevt == T_SWIPE_RIGHT) {
+                s_delete_pending = false;
+                s_state = WORD_LIST;
+                uiWordList(s_scroll_top);
+                s_timer = now;
             }
             break;
     }

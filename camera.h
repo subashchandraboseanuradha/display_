@@ -13,8 +13,11 @@ bool cam_init(void);
 void cam_deinit(void);
 
 // Draw one live preview frame to TFT (RGB565 direct push, no JPEG decode).
-// Camera must be init'd. Call every loop iteration for live viewfinder.
 void cam_preview_frame(void);
+
+// Cycle to next filter. Returns filter name string.
+const char* cam_next_filter(void);
+const char* cam_filter_name(void);  // current filter name without cycling
 
 // Capture current frame, convert to JPEG, save to /photo_NNN.jpg on SD.
 bool cam_capture_save(SPIClass& spi_bus);

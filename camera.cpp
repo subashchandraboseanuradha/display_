@@ -79,8 +79,22 @@ bool cam_init() {
         return false;
     }
     _started = true;
-    Serial.printf("[CAM][T+%lums] Init OK. Frame=%dx?, JPEG quality=%d\n",
-                  millis(), CAM_JPEG_QUAL);
+
+    // Sensor tweaks after init
+    sensor_t* s = esp_camera_sensor_get();
+    if (s) {
+        s->set_hmirror(s, 1);         // 1 = mirror on (corrects OV5640 natural flip)
+        s->set_vflip(s, 1);           // 1 = vertical flip (adjust if upside-down)
+        s->set_special_effect(s, 0);  // normal filter
+        s->set_gain_ctrl(s, 1);       // auto gain (AGC)
+        s->set_exposure_ctrl(s, 1);   // auto exposure (AEC)
+        s->set_awb_gain(s, 1);        // auto white balance
+        s->set_whitebal(s, 1);
+        s->set_aec2(s, 1);            // AEC DSP
+        s->set_ae_level(s, 0);        // AE compensation
+    }
+
+    Serial.printf("[CAM][T+%lums] Init OK.\n", millis());
     return true;
 }
 
@@ -106,6 +120,28 @@ void cam_scan_photos() {
 
 // ── live preview ─────────────────────────────────────────────────────────────
 
+// ── filters ───────────────────────────────────────────────────────────────────
+// OV5640 hardware effects — zero CPU cost, applied in sensor silicon.
+// Values: 0=Normal 1=Negative 2=Grayscale 3=RedTint 4=GreenTint 5=BlueTint 6=Sepia
+
+static const char* FILTER_NAMES[] = {
+    "Normal", "Negative", "B&W", "RedTint", "GreenTint", "BlueTint", "Sepia"
+};
+static int _filter_idx = 0;
+static const int FILTER_COUNT = 7;
+
+const char* cam_filter_name() {
+    return FILTER_NAMES[_filter_idx];
+}
+
+const char* cam_next_filter() {
+    _filter_idx = (_filter_idx + 1) % FILTER_COUNT;
+    sensor_t* s = esp_camera_sensor_get();
+    if (s) s->set_special_effect(s, _filter_idx);
+    Serial.printf("[CAM] Filter → %s\n", FILTER_NAMES[_filter_idx]);
+    return FILTER_NAMES[_filter_idx];
+}
+
 static bool _preview_logged = false;
 
 void cam_preview_frame() {
@@ -127,6 +163,8 @@ bool cam_capture_save(SPIClass& spi_bus) {
     if (!_started) { Serial.println("[CAM] Not started"); return false; }
 
     Serial.printf("[CAM][T+%lums] Capturing...\n", millis());
+    // Brief delay to let AF/AE settle before grabbing frame
+    delay(120);
     camera_fb_t* fb = esp_camera_fb_get();
     if (!fb) { Serial.println("[CAM] fb_get FAILED"); return false; }
 
