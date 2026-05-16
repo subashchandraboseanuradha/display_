@@ -12,6 +12,8 @@
 
 bool deepgram_transcribe(const uint8_t* pcm_data, size_t pcm_size,
                          char* out_transcript, size_t out_max) {
+    out_transcript[0] = '\0';
+
     if (!pcm_data || pcm_size == 0) {
         Serial.println("[DG] No audio data");
         return false;
@@ -21,48 +23,55 @@ bool deepgram_transcribe(const uint8_t* pcm_data, size_t pcm_size,
         return false;
     }
 
-    Serial.printf("[DG] Sending %u bytes to Deepgram...\n", (unsigned)pcm_size);
+    Serial.printf("[DG][T+%lums] Sending %u bytes...\n", millis(), (unsigned)pcm_size);
 
-    // Heap-allocate so SSL context doesn't blow the stack
+    // Heap-allocate: WiFiClientSecure SSL context is too large for stack (~20KB)
     WiFiClientSecure* sc = new WiFiClientSecure;
-    if (!sc) { Serial.println("[DG] OOM"); return false; }
+    if (!sc) { Serial.println("[DG] OOM allocating SSL client"); return false; }
     sc->setInsecure(); // MVP: skip cert verification
 
-    HTTPClient http;
-    http.begin(*sc, DG_URL);
-    http.setTimeout(25000); // large upload can take ~10s on slow WiFi
-    http.addHeader("Authorization", "Token " DEEPGRAM_API_KEY);
-    http.addHeader("Content-Type",  "audio/raw");
+    int  code = 0;
+    String body;
 
-    // cast away const — HTTPClient::POST doesn't modify the buffer
-    int code = http.POST(const_cast<uint8_t*>(pcm_data), pcm_size);
+    // Scope HTTPClient so it destructs BEFORE delete sc.
+    // If http destructs AFTER delete sc, it accesses freed memory (sc's vtable) → crash PC=0x0.
+    {
+        HTTPClient http;
+        http.begin(*sc, DG_URL);
+        http.setTimeout(25000);
+        http.addHeader("Authorization", "Token " DEEPGRAM_API_KEY);
+        http.addHeader("Content-Type",  "audio/raw");
 
-    if (code != 200) {
-        Serial.printf("[DG] HTTP error: %d\n", code);
-        Serial.println(http.getString().substring(0, 300));
+        code = http.POST(const_cast<uint8_t*>(pcm_data), pcm_size);
+
+        if (code == 200) {
+            body = http.getString();
+        } else {
+            Serial.printf("[DG] HTTP error: %d\n", code);
+            Serial.println(http.getString().substring(0, 300));
+        }
         http.end();
-        delete sc;
-        return false;
-    }
+    } // http destroyed here — sc still valid
 
-    String body = http.getString();
-    http.end();
-    delete sc;
+    delete sc;  // safe: http is gone
 
-    Serial.printf("[DG] Response %d bytes\n", body.length());
+    if (code != 200) return false;
 
-    // Parse: "alternatives":[{"transcript":"...","confidence":...}]
+    Serial.printf("[DG][T+%lums] Response %d bytes\n", millis(), body.length());
+
+    // Parse: find "transcript":"<text>"
     int idx = body.indexOf("\"transcript\":\"");
     if (idx < 0) {
-        Serial.println("[DG] No transcript field in response");
-        Serial.println(body.substring(0, 400));
+        Serial.println("[DG] No transcript in response. First 500 chars:");
+        Serial.println(body.substring(0, 500));
         return false;
     }
     idx += 14; // skip past  "transcript":"
-    int end = body.indexOf('"', idx);
-    if (end < 0) return false;
+    int endq = body.indexOf('"', idx);
+    if (endq < 0) { Serial.println("[DG] Malformed JSON"); return false; }
 
-    body.substring(idx, end).toCharArray(out_transcript, out_max);
-    Serial.printf("[DG] Transcript: \"%s\"\n", out_transcript);
-    return true;
+    body.substring(idx, endq).toCharArray(out_transcript, out_max);
+    Serial.printf("[DG] Transcript (%d chars): \"%s\"\n",
+                  strlen(out_transcript), out_transcript);
+    return strlen(out_transcript) > 0;
 }
