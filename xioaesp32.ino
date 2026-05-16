@@ -1,16 +1,14 @@
 /*
- * IDEA CAPTURE — STEP 2 (MVP)
- * Seeed XIAO ESP32S3 Sense + Round Display (GC9A01 240x240)
+ * IDEA CAPTURE — MVP
+ * Seeed XIAO ESP32S3 Sense + Round Display (GC9A01 240×240)
  *
- * Flow:
- *   Tap → record PDM mic to PSRAM
- *   Tap → stop → send raw PCM to Deepgram → get transcript
- *   Save transcript as /note_NNN.txt on SD
- *   Show transcript on Screen 2
- *   Swipe left/right on Screen 2 to browse all saved notes
- *   Tap Screen 2 to return to Screen 1 and record another idea
- *
- * Serial @ 115200 for full event log.
+ * Screen 1 (IDLE):     Mic icon → tap to record
+ * Screen 1 (RECORDING): Red circle + timer → tap to stop
+ * Screen 1 (SENDING):  Sends to Deepgram, saves note
+ * Screen 2 (LIST):     All ideas, newest first. Swipe up/down to scroll.
+ *                       Tap a note → expands to full text.
+ *                       Tap header → back to IDLE.
+ * Screen 2 (DETAIL):   Full note text. Tap → back to list.
  */
 
 #include <Arduino.h>
@@ -18,44 +16,51 @@
 #include <WiFi.h>
 #define USE_TFT_ESPI_LIBRARY
 #include <TFT_eSPI.h>
-#include "lv_xiao_round_screen.h"  // extern TFT_eSPI tft + chsc6x_is_pressed/get_xy
+#include "lv_xiao_round_screen.h"
 #include "sdcard.h"
 #include "i2s_mic.h"
 #include "deepgram.h"
 #include "secrets.h"
 
-// ── C bridges for dead LVGL UI files ─────────────────────────────────────────
 extern "C" uint32_t ui_get_millis()            { return millis(); }
 extern "C" void     ui_log_event(const char* m) { Serial.println(m); }
 extern "C" void     ui_log_event_v(const char*, ...) {}
 
-// ── State machine ─────────────────────────────────────────────────────────────
-#define IDLE          0
-#define RECORDING     1
-#define WAITING_STOP  2
-#define TRANSCRIBING  3
-#define VIEWING_NOTES 4
-static int s_state = IDLE;
-static uint32_t  s_timer        = 0;
+// ── States ────────────────────────────────────────────────────────────────────
+#define IDLE         0
+#define RECORDING    1
+#define WAITING_STOP 2
+#define TRANSCRIBING 3
+#define LIST_VIEW    4
+#define NOTE_DETAIL  5
+static int      s_state = IDLE;
+static uint32_t s_timer = 0;
 
 // ── Notes ─────────────────────────────────────────────────────────────────────
-static int  s_note_count   = 0;   // total notes on SD
-static int  s_note_counter = 0;   // next note number to write
-static int  s_current_note = 1;   // which note is on screen (1-based)
-static char s_transcript[640];    // Deepgram result + SD buffer
+#define MAX_NOTES_CACHE 60
+#define PREVIEW_CHARS   22   // chars shown per note in list
 
-// ── Touch / swipe ─────────────────────────────────────────────────────────────
-static bool       s_touch_prev    = false;
-static lv_coord_t s_swipe_start_x = 0;
-static lv_coord_t s_swipe_last_x  = 0;
-static lv_coord_t s_tap_y         = 0;  // Y at touch-down for zone detection
-static uint32_t   s_touch_start_t = 0;
+static int  s_note_count   = 0;
+static int  s_note_counter = 0;       // next note number to write
+static int  s_scroll_top   = 0;       // first visible note (0 = newest)
+static int  s_detail_rank  = 0;       // which rank to show in detail (0=newest)
+static char s_transcript[640];
 
-// Arduino IDE auto-generates prototypes before enum scope — use #define to avoid "does not name a type"
+// Preview cache: rank 0 = newest note, rank 1 = second newest, …
+static char s_previews[MAX_NOTES_CACHE][PREVIEW_CHARS + 1];
+
+// ── Touch ─────────────────────────────────────────────────────────────────────
 #define T_NONE        0
 #define T_TAP         1
 #define T_SWIPE_LEFT  2
 #define T_SWIPE_RIGHT 3
+#define T_SWIPE_UP    4   // finger moves up → list scrolls down
+#define T_SWIPE_DOWN  5   // finger moves down → list scrolls up
+
+static bool       s_touch_prev    = false;
+static lv_coord_t s_swipe_start_x = 0, s_swipe_last_x = 0;
+static lv_coord_t s_swipe_start_y = 0, s_swipe_last_y = 0;
+static uint32_t   s_touch_start_t = 0;
 
 int checkTouch() {
     bool pressed = chsc6x_is_pressed();
@@ -64,33 +69,40 @@ int checkTouch() {
         chsc6x_get_xy(&x, &y);
         if (x != 0 || y != 0) {
             if (!s_touch_prev) {
-                s_swipe_start_x = x;
-                s_tap_y         = y;   // capture Y at first touch
+                s_swipe_start_x = x; s_swipe_start_y = y;
                 s_touch_start_t = millis();
                 s_touch_prev    = true;
             }
-            s_swipe_last_x = x;
+            s_swipe_last_x = x; s_swipe_last_y = y;
         }
         return T_NONE;
     }
     if (!s_touch_prev) return T_NONE;
 
-    // Finger lifted
     s_touch_prev = false;
     int dx = (int)s_swipe_last_x - (int)s_swipe_start_x;
+    int dy = (int)s_swipe_last_y - (int)s_swipe_start_y;
     uint32_t dt = millis() - s_touch_start_t;
 
-    Serial.printf("[TOUCH] start_x=%d last_x=%d dx=%d dt=%lums\n",
-                  (int)s_swipe_start_x, (int)s_swipe_last_x, dx, dt);
+    Serial.printf("[TOUCH] dx=%d dy=%d dt=%lums  start(%d,%d)\n",
+                  dx, dy, dt, (int)s_swipe_start_x, (int)s_swipe_start_y);
 
-    if (abs(dx) > 40 && dt < 600) {
+    if (dt > 700) return T_NONE; // too slow = accidental
+
+    // Vertical swipe dominates when |dy| > |dx| and |dy| > 25
+    if (abs(dy) > abs(dx) && abs(dy) > 25) {
+        return dy < 0 ? T_SWIPE_UP : T_SWIPE_DOWN;
+    }
+    // Horizontal swipe
+    if (abs(dx) > 40) {
         return dx > 0 ? T_SWIPE_RIGHT : T_SWIPE_LEFT;
     }
-    if (abs(dx) < 25) return T_TAP;
+    // Tap
+    if (abs(dx) < 30 && abs(dy) < 30) return T_TAP;
     return T_NONE;
 }
 
-// ── Display helpers ───────────────────────────────────────────────────────────
+// ── Display: Screen 1 ────────────────────────────────────────────────────────
 
 void uiIdle() {
     tft.fillScreen(TFT_BLACK);
@@ -103,8 +115,9 @@ void uiIdle() {
     tft.drawCentreString("TAP TO RECORD", 120, 188, 2);
     if (s_note_count > 0) {
         tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-        char buf[20];
-        snprintf(buf, sizeof(buf), "%d idea%s saved", s_note_count, s_note_count == 1 ? "" : "s");
+        char buf[22];
+        snprintf(buf, sizeof(buf), "%d idea%s  swipe left",
+                 s_note_count, s_note_count == 1 ? "" : "s");
         tft.drawCentreString(buf, 120, 210, 1);
     }
 }
@@ -113,107 +126,178 @@ void uiRecording(uint32_t elapsed_ms) {
     tft.fillScreen(TFT_BLACK);
     tft.fillCircle(120, 120, 95, TFT_RED);
     tft.setTextColor(TFT_WHITE, TFT_RED);
-    tft.drawCentreString("REC", 120, 92, 4);
-    char buf[10];
+    tft.drawCentreString("REC", 120, 85, 4);
+    char t[10];
     uint32_t s = elapsed_ms / 1000;
-    snprintf(buf, sizeof(buf), "%02lu:%02lu", s / 60, s % 60);
-    tft.drawCentreString(buf, 120, 132, 4);
-    tft.setTextColor(TFT_WHITE, TFT_RED);
+    snprintf(t, sizeof(t), "%02lu:%02lu", s / 60, s % 60);
+    tft.drawCentreString(t, 120, 130, 4);
     tft.drawCentreString("tap to stop", 120, 168, 2);
 }
 
-void uiStatus(const char* line1, const char* line2 = nullptr, uint16_t col = TFT_WHITE) {
+void uiStatus(const char* line1, const char* line2, uint16_t col = TFT_WHITE) {
     tft.fillScreen(TFT_BLACK);
     tft.setTextColor(col, TFT_BLACK);
-    tft.drawCentreString(line1, 120, 105, 2);
+    tft.drawCentreString(line1, 120, 102, 2);
     if (line2) {
         tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-        tft.drawCentreString(line2, 120, 130, 2);
+        tft.drawCentreString(line2, 120, 128, 2);
     }
 }
 
-// Draw text word-wrapped within a box. Returns y position after last line.
-// Avoids the circular clip region by constraining to safe inner rectangle.
-static void drawWrappedText(const char* text, int x, int y, int w, int maxY) {
+// ── Display: Screen 2 — scrollable list ──────────────────────────────────────
+// Layout: header y=9, divider y=23, items from y=26 (34px each), up to 5 visible.
+// Round display safe text zone at list y range: x ≈ [35..205].
+
+#define LIST_ITEM_H  34
+#define LIST_START_Y 26
+#define LIST_VISIBLE 5
+
+void uiNotesList() {
+    tft.fillScreen(TFT_BLACK);
+
+    // Header — tap = IDLE
+    tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    char hdr[20];
+    snprintf(hdr, sizeof(hdr), "IDEAS  (%d)", s_note_count);
+    tft.drawCentreString(hdr, 120, 9, 2);
+    // up arrow if scrolled down
+    if (s_scroll_top > 0) {
+        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.drawString("\x1e", 210, 9, 2); // ▲ fallback: just show hint
+        tft.drawCentreString("^", 215, 8, 2);
+    }
+    tft.drawFastHLine(25, 23, 190, TFT_CYAN);
+
+    int visible = min(LIST_VISIBLE, s_note_count - s_scroll_top);
+    for (int i = 0; i < visible; i++) {
+        int rank   = s_scroll_top + i;         // 0 = newest
+        int num    = s_note_count - rank;       // actual note number
+        int y      = LIST_START_Y + i * LIST_ITEM_H;
+
+        // Note number (small, cyan)
+        tft.setTextFont(1);
+        tft.setTextColor(TFT_CYAN, TFT_BLACK);
+        char badge[8];
+        snprintf(badge, sizeof(badge), "IDEA %d", num);
+        tft.drawString(badge, 35, y + 1);
+
+        // Preview (one line, white)
+        tft.setTextFont(2);
+        tft.setTextColor(TFT_WHITE, TFT_BLACK);
+        char prev[PREVIEW_CHARS + 4];
+        strncpy(prev, s_previews[rank], PREVIEW_CHARS);
+        prev[PREVIEW_CHARS] = '\0';
+        // append "…" if note was truncated in cache
+        if (strlen(s_previews[rank]) >= PREVIEW_CHARS) {
+            prev[PREVIEW_CHARS - 2] = '.';
+            prev[PREVIEW_CHARS - 1] = '.';
+        }
+        tft.drawString(prev, 35, y + 12);
+
+        // Divider
+        if (i < visible - 1)
+            tft.drawFastHLine(35, y + LIST_ITEM_H - 1, 170, 0x2104);
+    }
+
+    // Scroll hint: more notes below
+    if (s_scroll_top + LIST_VISIBLE < s_note_count) {
+        tft.drawFastHLine(25, 196, 190, 0x2104);
+        tft.setTextFont(1);
+        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.drawCentreString("swipe up for more", 120, 202, 1);
+    }
+
+    // Footer hint
+    tft.setTextFont(1);
+    tft.setTextColor(0x2104, TFT_BLACK);
+    tft.drawCentreString("tap header = record new", 120, 218, 1);
+}
+
+// ── Display: Screen 2 — note detail ──────────────────────────────────────────
+
+static void drawWrappedText(const char* text, int x, int y_start, int w, int max_y) {
     tft.setTextFont(2);
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    tft.setTextWrap(false);   // manual wrap so we control line width
+    tft.setTextWrap(false);
 
-    const int LINE_H   = 18;  // font2=16px + 2px leading
-    const int CHAR_W   = 8;   // font2 avg char width (conservative)
-    int       max_chars = w / CHAR_W;
+    const int LINE_H  = 18;
+    const int CHAR_W  = 8;
+    int max_chars = w / CHAR_W;
 
     char line[64];
     const char* p = text;
-    int cur_y = y;
+    int cy = y_start;
 
-    while (*p && cur_y + LINE_H <= maxY) {
-        // copy up to max_chars or next newline
+    while (*p && cy + LINE_H <= max_y) {
         int n = 0;
         while (p[n] && p[n] != '\n' && n < max_chars) n++;
-
-        // back up to last space if mid-word (word wrap)
+        // word-wrap: back up to last space
         if (p[n] && p[n] != '\n' && n == max_chars) {
             int bp = n;
             while (bp > 0 && p[bp] != ' ') bp--;
             if (bp > 0) n = bp;
         }
-
         strncpy(line, p, n);
         line[n] = '\0';
-
-        tft.setCursor(x, cur_y);
+        tft.setCursor(x, cy);
         tft.print(line);
-        cur_y += LINE_H;
-
+        cy += LINE_H;
         p += n;
         if (*p == ' ' || *p == '\n') p++;
     }
-
-    // If more text remains, overwrite last line end with "..."
-    if (*p && cur_y > y) {
-        tft.setCursor(x + w - 24, cur_y - LINE_H);
+    if (*p && cy > y_start) {
+        tft.setCursor(x + w - 20, cy - LINE_H);
         tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
         tft.print("...");
     }
 }
 
-void uiNotes(int current, int total, const char* text) {
+void uiNoteDetail(int rank, const char* text) {
+    int num = s_note_count - rank;
     tft.fillScreen(TFT_BLACK);
 
-    // ── Header: note counter  (tap = back to record) ─────────────────────────
+    // Header
     tft.setTextColor(TFT_CYAN, TFT_BLACK);
-    char hdr[20];
-    snprintf(hdr, sizeof(hdr), "IDEA  %d / %d", current, total);
-    tft.drawCentreString(hdr, 120, 13, 2);
-    tft.drawFastHLine(30, 29, 180, TFT_CYAN);
+    char hdr[16];
+    snprintf(hdr, sizeof(hdr), "IDEA %d", num);
+    tft.drawCentreString(hdr, 120, 11, 2);
+    tft.drawFastHLine(30, 27, 180, TFT_CYAN);
 
-    // ── Note text — safe inner rectangle 35,34 → 205,195 ─────────────────────
-    drawWrappedText(text, 35, 34, 170, 193);
+    // Full text
+    drawWrappedText(text, 35, 34, 170, 200);
 
-    // ── Bottom nav row ────────────────────────────────────────────────────────
-    tft.drawFastHLine(30, 198, 180, 0x2104);  // dim separator
-
-    bool multi = (total > 1);
-    // Left arrow — tap zone: x<110, y>195
-    tft.setTextColor(multi ? TFT_WHITE : TFT_DARKGREY, TFT_BLACK);
-    tft.drawCentreString("<", 60, 206, 4);
-
-    // Right arrow — tap zone: x>130, y>195
-    tft.drawCentreString(">", 180, 206, 4);
-
-    // Centre: tiny counter
+    // Footer
     tft.setTextFont(1);
     tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-    char ctr[8];
-    snprintf(ctr, sizeof(ctr), "%d/%d", current, total);
-    tft.drawCentreString(ctr, 120, 216, 1);
+    tft.drawCentreString("tap = back to list", 120, 220, 1);
 }
 
-// ── Notes SD helpers ──────────────────────────────────────────────────────────
+// ── Notes: SD helpers ─────────────────────────────────────────────────────────
 
-static void scanNotes() {
-    Serial.printf("[NOTE][T+%lums] Scanning for existing notes...\n", millis());
+static void loadAllPreviews() {
+    if (s_note_count == 0) return;
+    Serial.printf("[NOTE] Loading %d previews...\n", s_note_count);
+    int cached = min(s_note_count, MAX_NOTES_CACHE);
+    for (int rank = 0; rank < cached; rank++) {
+        int num = s_note_count - rank;
+        char path[24];
+        snprintf(path, sizeof(path), "/note_%03d.txt", num);
+        File f = SD.open(path, FILE_READ);
+        if (f) {
+            int n = f.readBytes(s_previews[rank], PREVIEW_CHARS);
+            s_previews[rank][n] = '\0';
+            for (int j = 0; j < n; j++)
+                if (s_previews[rank][j] == '\n') s_previews[rank][j] = ' ';
+            f.close();
+        } else {
+            s_previews[rank][0] = '\0';
+        }
+    }
+    Serial.printf("[NOTE] Previews loaded.\n");
+}
+
+static void scanAndLoadNotes() {
+    Serial.printf("[NOTE] Scanning notes...\n");
     s_note_count = 0;
     for (int i = 1; i <= 999; i++) {
         char p[24];
@@ -221,35 +305,34 @@ static void scanNotes() {
         if (!SD.exists(p)) { s_note_counter = i - 1; s_note_count = i - 1; break; }
         if (i == 999)       { s_note_counter = 999;   s_note_count = 999; }
     }
-    Serial.printf("[NOTE][T+%lums] Found %d notes, next will be #%d\n",
-                  millis(), s_note_count, s_note_counter + 1);
+    Serial.printf("[NOTE] Found %d notes.\n", s_note_count);
+    loadAllPreviews();
 }
 
 static bool saveNote(int num, const char* text) {
     char path[24];
     snprintf(path, sizeof(path), "/note_%03d.txt", num);
-    Serial.printf("[NOTE][T+%lums] Saving %s...\n", millis(), path);
     File f = SD.open(path, FILE_WRITE);
-    if (!f) { Serial.printf("[NOTE][T+%lums] FAILED to open %s\n", millis(), path); return false; }
+    if (!f) { Serial.printf("[NOTE] FAIL open %s\n", path); return false; }
     f.print(text);
     f.close();
-    Serial.printf("[NOTE][T+%lums] Saved %s (%d chars)\n", millis(), path, strlen(text));
+    Serial.printf("[NOTE] Saved %s (%d chars)\n", path, strlen(text));
     return true;
 }
 
-static bool loadNote(int num, char* buf, size_t max) {
+static bool loadNoteText(int rank, char* buf, size_t max) {
+    int num = s_note_count - rank;
     char path[24];
     snprintf(path, sizeof(path), "/note_%03d.txt", num);
     File f = SD.open(path, FILE_READ);
-    if (!f) { Serial.printf("[NOTE] Cannot open %s\n", path); return false; }
+    if (!f) return false;
     size_t n = f.readBytes(buf, max - 1);
     buf[n] = '\0';
     f.close();
     return true;
 }
 
-// ── WiFi ─────────────────────────────────────────────────────────────────────
-
+// ── WiFi ──────────────────────────────────────────────────────────────────────
 static bool s_wifi_ok = false;
 
 static void wifiConnect() {
@@ -265,94 +348,77 @@ static void wifiConnect() {
     uint8_t dots = 0;
     while (WiFi.status() != WL_CONNECTED && millis() - t < 20000) {
         delay(500);
-        tft.fillRect(95, 148, 50, 12, TFT_BLACK);
+        tft.fillRect(95, 145, 50, 14, TFT_BLACK);
         char d[8] = {0};
         for (uint8_t i = 0; i < dots % 4; i++) d[i] = '.';
-        tft.drawCentreString(d, 120, 148, 2);
+        tft.drawCentreString(d, 120, 147, 2);
         dots++;
     }
-
     if (WiFi.status() == WL_CONNECTED) {
         s_wifi_ok = true;
-        Serial.printf("[WiFi] Connected: %s\n", WiFi.localIP().toString().c_str());
+        Serial.printf("[WiFi] %s\n", WiFi.localIP().toString().c_str());
         tft.setTextColor(TFT_GREEN, TFT_BLACK);
-        tft.drawCentreString("WiFi OK", 120, 148, 2);
+        tft.drawCentreString("WiFi OK", 120, 147, 2);
     } else {
         s_wifi_ok = false;
-        Serial.println("[WiFi] FAILED — offline mode");
+        Serial.println("[WiFi] FAILED — offline");
         tft.setTextColor(TFT_RED, TFT_BLACK);
-        tft.drawCentreString("WiFi FAILED", 120, 148, 2);
-        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-        tft.drawCentreString("(no transcription)", 120, 168, 1);
+        tft.drawCentreString("WiFi FAILED", 120, 147, 2);
     }
-    delay(1200);
+    delay(1000);
 }
 
 // ── Setup ─────────────────────────────────────────────────────────────────────
-
 void setup() {
     Serial.begin(115200);
     delay(800);
     Serial.println("\n========================================");
-    Serial.printf("[MAIN][T+%lums] BOOT — Idea Capture MVP\n", millis());
+    Serial.printf("[MAIN][T+%lums] BOOT — Idea Capture\n", millis());
     Serial.println("========================================");
 
     Wire.begin(5, 6);
-
-    Serial.printf("[MAIN][T+%lums] tft.begin()\n", millis());
     tft.begin();
     tft.setRotation(0);
     pinMode(43, OUTPUT);
     digitalWrite(43, HIGH);
-    Serial.printf("[MAIN][T+%lums] Display OK.\n", millis());
+    Serial.printf("[MAIN] Display OK.\n");
 
-    // SD init
+    // SD
     tft.fillScreen(TFT_BLACK);
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
     tft.drawCentreString("Checking SD...", 120, 108, 2);
-
     bool sd_ok = init_sd_card(tft.getSPIinstance());
     if (!sd_ok) {
         tft.setTextColor(TFT_RED, TFT_BLACK);
-        tft.drawCentreString("SD FAILED!", 120, 140, 4);
-        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-        tft.drawCentreString("Insert card & reboot", 120, 170, 1);
-        Serial.println("[MAIN] SD failed — halting.");
+        tft.drawCentreString("SD FAILED", 120, 140, 4);
         while (true) delay(1000);
     }
-
-    // Scan existing notes
     sd_reinit(tft.getSPIinstance());
-    scanNotes();
+    scanAndLoadNotes();
     sd_release();
 
     tft.setTextColor(TFT_GREEN, TFT_BLACK);
-    char sdbuf[32];
-    snprintf(sdbuf, sizeof(sdbuf), "SD OK — %d ideas saved", s_note_count);
-    tft.drawCentreString(sdbuf, 120, 140, 2);
-    delay(800);
+    char sb[28];
+    snprintf(sb, sizeof(sb), "SD OK — %d ideas", s_note_count);
+    tft.drawCentreString(sb, 120, 140, 2);
+    delay(700);
 
-    // WiFi
     wifiConnect();
 
-    // Mic
-    Serial.printf("[MAIN][T+%lums] mic_init()\n", millis());
     mic_init();
-
-    Serial.printf("[MAIN][T+%lums] READY.\n", millis());
+    Serial.printf("[MAIN] READY.\n");
     uiIdle();
     s_state = IDLE;
     s_timer = millis();
 }
 
 // ── Loop ──────────────────────────────────────────────────────────────────────
-
-static uint32_t s_rec_start    = 0;
-static uint32_t s_ui_refresh   = 0;
+static uint32_t s_rec_start  = 0;
+static uint32_t s_ui_refresh = 0;
 
 void loop() {
-    uint32_t now    = millis();
-    int tevt = checkTouch();
+    uint32_t now  = millis();
+    int      tevt = checkTouch();
 
     switch (s_state) {
 
@@ -360,27 +426,21 @@ void loop() {
         case IDLE:
             if (tevt == T_TAP && now - s_timer > 800) {
                 s_timer = now;
-                Serial.printf("[MAIN][T+%lums] Tap → start recording\n", now);
                 if (start_i2s_recording()) {
-                    s_state      = RECORDING;
-                    s_rec_start  = now;
-                    s_ui_refresh = now;
+                    s_state = RECORDING;
+                    s_rec_start = s_ui_refresh = now;
                     uiRecording(0);
                 } else {
-                    uiStatus("Mic failed", "check PSRAM setting", TFT_RED);
-                    delay(2500);
-                    uiIdle();
+                    uiStatus("Mic failed", "check PSRAM=OPI in IDE", TFT_RED);
+                    delay(2500); uiIdle();
                 }
             }
-            // Long swipe in IDLE → open notes browser if notes exist
-            if (tevt == T_SWIPE_LEFT && s_note_count > 0) {
-                s_current_note = s_note_count; // show latest
-                sd_reinit(tft.getSPIinstance());
-                loadNote(s_current_note, s_transcript, sizeof(s_transcript));
-                sd_release();
-                uiNotes(s_current_note, s_note_count, s_transcript);
-                s_state = VIEWING_NOTES;
+            // Swipe left from IDLE → open notes list
+            if (tevt == T_SWIPE_LEFT && s_note_count > 0 && now - s_timer > 400) {
+                s_scroll_top = 0;
+                s_state = LIST_VIEW;
                 s_timer = now;
+                uiNotesList();
             }
             break;
 
@@ -392,7 +452,6 @@ void loop() {
             }
             if (tevt == T_TAP && now - s_timer > 1200) {
                 s_timer = now;
-                Serial.printf("[MAIN][T+%lums] Tap → stop recording\n", now);
                 stop_i2s_recording();
                 uiStatus("Stopping...", nullptr, TFT_YELLOW);
                 s_state = WAITING_STOP;
@@ -403,30 +462,18 @@ void loop() {
         case WAITING_STOP:
             if (!is_recording()) {
                 size_t bytes = get_audio_buffer_size();
-                float  secs  = (float)bytes / 32000.0f;
-                Serial.printf("[MAIN][T+%lums] Captured %.1fs (%u bytes)\n", now, secs, (unsigned)bytes);
-
+                float  secs  = bytes / 32000.0f;
+                Serial.printf("[MAIN] Captured %.1fs (%u bytes)\n", secs, (unsigned)bytes);
                 if (bytes < 16000) {
                     uiStatus("Too short", "tap to try again", TFT_ORANGE);
-                    delay(2000);
-                    uiIdle();
-                    s_state = IDLE;
-                    s_timer = millis();
-                    break;
+                    delay(2000); uiIdle(); s_state = IDLE; s_timer = millis(); break;
                 }
-
                 if (!s_wifi_ok) {
                     uiStatus("No WiFi", "can't transcribe", TFT_RED);
-                    delay(2500);
-                    uiIdle();
-                    s_state = IDLE;
-                    s_timer = millis();
-                    break;
+                    delay(2500); uiIdle(); s_state = IDLE; s_timer = millis(); break;
                 }
-
                 uiStatus("Sending idea...", "please wait");
                 s_state = TRANSCRIBING;
-                // Deepgram call happens next iteration (gives screen time to render)
             }
             break;
 
@@ -434,105 +481,125 @@ void loop() {
         case TRANSCRIBING: {
             memset(s_transcript, 0, sizeof(s_transcript));
             bool ok = deepgram_transcribe(
-                get_audio_buffer(),
-                get_audio_buffer_size(),
-                s_transcript, sizeof(s_transcript) - 1
-            );
+                get_audio_buffer(), get_audio_buffer_size(),
+                s_transcript, sizeof(s_transcript) - 1);
 
             if (ok && strlen(s_transcript) > 0) {
-                Serial.printf("[MAIN][T+%lums] Transcript: \"%s\"\n", millis(), s_transcript);
-
-                // Save to SD
+                // Save note
                 s_note_counter++;
                 s_note_count++;
                 sd_reinit(tft.getSPIinstance());
-                bool saved = saveNote(s_note_counter, s_transcript);
+                saveNote(s_note_counter, s_transcript);
+                // Update preview cache: shift everything down, insert at rank 0
+                int cached = min(s_note_count, MAX_NOTES_CACHE);
+                for (int r = cached - 1; r > 0; r--)
+                    memcpy(s_previews[r], s_previews[r-1], PREVIEW_CHARS + 1);
+                strncpy(s_previews[0], s_transcript, PREVIEW_CHARS);
+                s_previews[0][PREVIEW_CHARS] = '\0';
                 sd_release();
 
-                if (!saved) {
-                    Serial.println("[MAIN] Note save FAILED");
-                }
-
-                // Show on Screen 2
-                s_current_note = s_note_counter;
-                uiNotes(s_current_note, s_note_count, s_transcript);
-                s_state = VIEWING_NOTES;
+                // Jump to list, scrolled to top (newest note)
+                s_scroll_top = 0;
+                s_state = LIST_VIEW;
+                uiNotesList();
             } else {
-                Serial.println("[MAIN] Transcription failed");
-                uiStatus("No transcript", "tap to try again", TFT_RED);
-                delay(2500);
-                uiIdle();
-                s_state = IDLE;
+                uiStatus("No transcript", "tap to retry", TFT_RED);
+                delay(2500); uiIdle(); s_state = IDLE;
             }
             s_timer = millis();
             break;
         }
 
-        // ── VIEWING_NOTES ─────────────────────────────────────────────────────
-        // Navigation by tap zone:
-        //   x < 60         = tap LEFT arrow  → prev note
-        //   x > 180        = tap RIGHT arrow → next note
-        //   x 60–180, y<40 = tap HEADER      → back to record
-        //   x 60–180, y≥40 = tap centre      → back to record
-        //   swipe left/right also works as fallback
-        case VIEWING_NOTES:
-            if (now - s_timer < 400) break; // debounce
+        // ── LIST_VIEW ─────────────────────────────────────────────────────────
+        case LIST_VIEW:
+            if (now - s_timer < 300) break;  // debounce after state entry
 
-            if (tevt == T_TAP) {
-                int tap_x = (int)s_swipe_last_x;  // X at release
-                int tap_y = (int)s_tap_y;          // Y at touch-down
-
-                Serial.printf("[MAIN] Notes tap x=%d y=%d\n", tap_x, tap_y);
-
-                bool nav_handled = false;
-                if (tap_y > 195 && s_note_count > 1) {
-                    // Bottom nav row
-                    if (tap_x < 110) {
-                        // < arrow — prev
-                        s_current_note--;
-                        if (s_current_note < 1) s_current_note = s_note_count;
-                        Serial.printf("[MAIN] < prev → note %d/%d\n", s_current_note, s_note_count);
-                        nav_handled = true;
-                    } else if (tap_x > 130) {
-                        // > arrow — next
-                        s_current_note++;
-                        if (s_current_note > s_note_count) s_current_note = 1;
-                        Serial.printf("[MAIN] > next → note %d/%d\n", s_current_note, s_note_count);
-                        nav_handled = true;
-                    }
-                    if (nav_handled) {
-                        sd_reinit(tft.getSPIinstance());
-                        loadNote(s_current_note, s_transcript, sizeof(s_transcript));
-                        sd_release();
-                        uiNotes(s_current_note, s_note_count, s_transcript);
-                    }
+            if (tevt == T_SWIPE_UP) {
+                // Scroll down → older notes
+                if (s_scroll_top + LIST_VISIBLE < s_note_count) {
+                    s_scroll_top++;
+                    uiNotesList();
+                    s_timer = now;
                 }
-                if (!nav_handled) {
-                    // Tap anywhere else = back to record
+            }
+            else if (tevt == T_SWIPE_DOWN) {
+                // Scroll up → newer notes
+                if (s_scroll_top > 0) {
+                    s_scroll_top--;
+                    uiNotesList();
+                    s_timer = now;
+                }
+            }
+            else if (tevt == T_TAP) {
+                int tap_y = (int)s_swipe_start_y;
+                int tap_x = (int)s_swipe_last_x;
+                Serial.printf("[LIST] tap y=%d x=%d\n", tap_y, tap_x);
+
+                if (tap_y < 25) {
+                    // Header → back to record
                     s_state = IDLE;
                     uiIdle();
-                    Serial.printf("[MAIN] Notes → IDLE\n");
+                } else {
+                    // Which item?
+                    int item = (tap_y - LIST_START_Y) / LIST_ITEM_H;
+                    int rank = s_scroll_top + item;
+                    if (item >= 0 && rank < s_note_count) {
+                        // Load full text and show detail
+                        s_detail_rank = rank;
+                        sd_reinit(tft.getSPIinstance());
+                        bool loaded = loadNoteText(rank, s_transcript, sizeof(s_transcript));
+                        sd_release();
+                        if (loaded) {
+                            uiNoteDetail(rank, s_transcript);
+                            s_state = NOTE_DETAIL;
+                        }
+                    }
                 }
                 s_timer = now;
             }
-            else if (tevt == T_SWIPE_LEFT && s_note_count > 1) {
-                s_current_note++;
-                if (s_current_note > s_note_count) s_current_note = 1;
-                Serial.printf("[MAIN] Swipe left → note %d\n", s_current_note);
-                sd_reinit(tft.getSPIinstance());
-                loadNote(s_current_note, s_transcript, sizeof(s_transcript));
-                sd_release();
-                uiNotes(s_current_note, s_note_count, s_transcript);
+            else if (tevt == T_SWIPE_RIGHT) {
+                // Swipe right from list → back to IDLE
+                s_state = IDLE;
+                uiIdle();
                 s_timer = now;
             }
-            else if (tevt == T_SWIPE_RIGHT && s_note_count > 1) {
-                s_current_note--;
-                if (s_current_note < 1) s_current_note = s_note_count;
-                Serial.printf("[MAIN] Swipe right → note %d\n", s_current_note);
+            break;
+
+        // ── NOTE_DETAIL ───────────────────────────────────────────────────────
+        case NOTE_DETAIL:
+            if (now - s_timer < 400) break;
+
+            if (tevt == T_TAP || tevt == T_SWIPE_RIGHT) {
+                // Back to list
+                s_state = LIST_VIEW;
+                uiNotesList();
+                s_timer = now;
+            }
+            // Swipe left/right: navigate to prev/next note
+            else if (tevt == T_SWIPE_LEFT && s_detail_rank < s_note_count - 1) {
+                s_detail_rank++;
                 sd_reinit(tft.getSPIinstance());
-                loadNote(s_current_note, s_transcript, sizeof(s_transcript));
+                loadNoteText(s_detail_rank, s_transcript, sizeof(s_transcript));
                 sd_release();
-                uiNotes(s_current_note, s_note_count, s_transcript);
+                uiNoteDetail(s_detail_rank, s_transcript);
+                s_timer = now;
+            }
+            else if (tevt == T_SWIPE_UP) {
+                s_detail_rank++;
+                if (s_detail_rank >= s_note_count) s_detail_rank = s_note_count - 1;
+                sd_reinit(tft.getSPIinstance());
+                loadNoteText(s_detail_rank, s_transcript, sizeof(s_transcript));
+                sd_release();
+                uiNoteDetail(s_detail_rank, s_transcript);
+                s_timer = now;
+            }
+            else if (tevt == T_SWIPE_DOWN) {
+                s_detail_rank--;
+                if (s_detail_rank < 0) s_detail_rank = 0;
+                sd_reinit(tft.getSPIinstance());
+                loadNoteText(s_detail_rank, s_transcript, sizeof(s_transcript));
+                sd_release();
+                uiNoteDetail(s_detail_rank, s_transcript);
                 s_timer = now;
             }
             break;
