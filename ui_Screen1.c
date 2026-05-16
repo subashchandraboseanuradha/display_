@@ -23,7 +23,7 @@ void ui_event_defaultrecord(lv_event_t * e)
 {
     lv_event_code_t event_code = lv_event_get_code(e);
 
-    if(event_code == LV_EVENT_VALUE_CHANGED) {
+    if(event_code == LV_EVENT_CLICKED) {
         on_record_toggle(e);
     }
 }
@@ -64,7 +64,6 @@ void ui_Screen1_screen_init(void)
     lv_obj_set_width(ui_defaultrecord, 64);
     lv_obj_set_height(ui_defaultrecord, 64);
     lv_obj_set_align(ui_defaultrecord, LV_ALIGN_CENTER);
-    lv_obj_add_flag(ui_defaultrecord, LV_OBJ_FLAG_CHECKABLE);     /// Flags
 
     lv_obj_add_event_cb(ui_ImgButton1, ui_event_ImgButton1, LV_EVENT_ALL, NULL);
     lv_obj_add_event_cb(ui_defaultrecord, ui_event_defaultrecord, LV_EVENT_ALL, NULL);

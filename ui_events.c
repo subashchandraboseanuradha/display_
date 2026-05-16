@@ -10,10 +10,11 @@ volatile int ui_rec_request = 0;  // 1=start, 2=stop
 
 void on_record_toggle(lv_event_t * e)
 {
-    lv_obj_t * btn = lv_event_get_target(e);
-    if (lv_obj_has_state(btn, LV_STATE_CHECKED)) {
-        ui_rec_request = 1;
-    } else {
-        ui_rec_request = 2;
-    }
+    static uint32_t last_click = 0;
+    uint32_t now = ui_get_millis();
+    if (now - last_click < 500) return;
+    last_click = now;
+    
+    ui_log_event("[UI-EV] Mic Clicked -> TOGGLE (3)");
+    ui_rec_request = 3; 
 }

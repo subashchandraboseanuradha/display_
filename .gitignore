@@ -9,6 +9,9 @@ bin/
 cache/
 backup/
 
+# Secrets — never commit
+secrets.h
+
 # Local settings
 .claude/
 .vscode/

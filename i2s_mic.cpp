@@ -1,109 +1,157 @@
 #include "i2s_mic.h"
-#include <SD.h>
+#include <Arduino.h>
 #include "ESP_I2S.h"
-#include "sdcard.h"
 
-#define I2S_CLK_PIN  42
-#define I2S_DATA_PIN 41
-#define SAMPLE_RATE  16000
-#define BUF_SIZE     512
+#define PDM_CLK_PIN   42
+#define PDM_DATA_PIN  41
+#define SAMPLE_RATE   16000
+#define BIT_DEPTH     16
+#define BYTES_PER_SEC (SAMPLE_RATE * (BIT_DEPTH / 8))  // 32000
+#define BUF_BYTES     (2 * 1024 * 1024)                // 2MB = ~65s
 
-static volatile bool _recording = false;       // true from start until task fully exits
-static volatile bool _stop_requested = false;  // set by stop_i2s_recording, polled by task
-static TaskHandle_t  _task_handle = NULL;
-static File          _wav_file;
+static volatile bool _stop_requested  = false;
+static TaskHandle_t  _rec_task_handle = NULL;
 static I2SClass      _i2s;
-static bool          _i2s_started = false;
+static bool          _i2s_started    = false;
+static uint8_t*      _audio_buf      = NULL;
+static size_t        _audio_buf_pos  = 0;
 
-struct WavHeader {
-    char     riff[4]         = {'R','I','F','F'};
-    uint32_t chunk_size      = 0;
-    char     wave[4]         = {'W','A','V','E'};
-    char     fmt[4]          = {'f','m','t',' '};
-    uint32_t subchunk1_size  = 16;
-    uint16_t audio_format    = 1;
-    uint16_t num_channels    = 1;
-    uint32_t sample_rate     = SAMPLE_RATE;
-    uint32_t byte_rate       = SAMPLE_RATE * 2;
-    uint16_t block_align     = 2;
-    uint16_t bits_per_sample = 16;
-    char     data[4]         = {'d','a','t','a'};
-    uint32_t data_size       = 0;
-};
-
-static void _fix_wav_header(uint32_t data_bytes) {
-    _wav_file.seek(0);
-    WavHeader hdr;
-    hdr.data_size  = data_bytes;
-    hdr.chunk_size = 36 + data_bytes;
-    _wav_file.write((uint8_t*)&hdr, sizeof(hdr));
-}
+// ── Recording task (Core 0) ───────────────────────────────────────────────────
 
 static void _i2s_record_task(void* param) {
-    uint8_t buf[BUF_SIZE];
-    uint32_t total_bytes = 0;
+    static uint8_t chunk[2048];  // static: off task stack (2KB would overflow 4096 budget)
+    uint32_t last_log  = 0;
+    uint32_t zero_runs = 0;
+    uint32_t t_start   = millis();
+
+    Serial.printf("[MIC][T+%lums] Task started on Core %d. PDM CLK=%d DATA=%d rate=%dHz\n",
+                  millis(), xPortGetCoreID(), PDM_CLK_PIN, PDM_DATA_PIN, SAMPLE_RATE);
 
     while (!_stop_requested) {
-        size_t n = _i2s.readBytes((char*)buf, sizeof(buf));
+        size_t n = _i2s.readBytes((char*)chunk, sizeof(chunk));
+
         if (n > 0) {
-            _wav_file.write(buf, n);
-            total_bytes += n;
+            zero_runs = 0;
+            if (_audio_buf_pos + n <= BUF_BYTES) {
+                memcpy(_audio_buf + _audio_buf_pos, chunk, n);
+                _audio_buf_pos += n;
+            } else {
+                Serial.printf("[MIC][T+%lums] Buffer FULL at %u bytes — auto-stop.\n",
+                              millis(), (unsigned)_audio_buf_pos);
+                break;
+            }
+        } else {
+            zero_runs++;
+            if (zero_runs % 500 == 0) {
+                Serial.printf("[MIC][T+%lums] WARNING: readBytes returned 0 x%u times\n",
+                              millis(), zero_runs);
+            }
         }
+
+        // Progress log every 5s
+        if (millis() - last_log > 5000) {
+            float secs = (float)_audio_buf_pos / BYTES_PER_SEC;
+            float fill = (float)_audio_buf_pos / BUF_BYTES * 100.0f;
+            Serial.printf("[MIC][T+%lums] Capturing... %.1fs  %u bytes  %.0f%% full\n",
+                          millis(), secs, (unsigned)_audio_buf_pos, fill);
+            last_log = millis();
+        }
+        vTaskDelay(1);
     }
 
-    _fix_wav_header(total_bytes);
-    _wav_file.close();
-    Serial.println("Recording saved");
+    float dur = (float)_audio_buf_pos / BYTES_PER_SEC;
+    Serial.printf("[MIC][T+%lums] Task done. %u bytes = %.2f seconds. Elapsed wall: %lums\n",
+                  millis(), (unsigned)_audio_buf_pos, dur, millis() - t_start);
 
-    _task_handle = NULL;
-    _stop_requested = false;
-    _recording = false;  // only now is it safe for TFT to use GPIO7 again
+    _stop_requested  = false;
+    _rec_task_handle = NULL;
     vTaskDelete(NULL);
 }
 
-extern "C" void get_next_recording_filename(char* buf, size_t len) {
-    static uint16_t counter = 0;
-    counter++;
-    snprintf(buf, len, "/rec_%03d.wav", counter);
+// ── Public API ────────────────────────────────────────────────────────────────
+
+extern "C" void mic_init() {
+    Serial.printf("[MIC][T+%lums] mic_init — allocating %dMB in PSRAM...\n",
+                  millis(), BUF_BYTES / (1024 * 1024));
+
+    if (_audio_buf) {
+        Serial.printf("[MIC][T+%lums] Buffer already allocated at 0x%08X\n",
+                      millis(), (unsigned)_audio_buf);
+        return;
+    }
+
+    _audio_buf = (uint8_t*)ps_malloc(BUF_BYTES);
+    if (_audio_buf) {
+        Serial.printf("[MIC][T+%lums] PSRAM buffer OK at 0x%08X (%dMB)\n",
+                      millis(), (unsigned)_audio_buf, BUF_BYTES / (1024 * 1024));
+    } else {
+        Serial.printf("[MIC][T+%lums] PSRAM alloc FAILED! Check: Tools > PSRAM = OPI PSRAM\n",
+                      millis());
+    }
 }
 
-extern "C" bool start_i2s_recording(const char* filepath) {
-    if (_recording) { Serial.println("already rec"); return false; }
+extern "C" bool start_i2s_recording() {
+    Serial.printf("[MIC][T+%lums] start_i2s_recording()\n", millis());
 
-    sd_reinit();  // restore GPIO7 as FSPI CLK after TFT_eSPI used it as CS
-    Serial.printf("rec: remove %s\n", filepath); Serial.flush();
-    SD.remove(filepath);
-    Serial.println("rec: open"); Serial.flush();
-    _wav_file = SD.open(filepath, FILE_WRITE);
-    if (!_wav_file) { Serial.println("SD open failed"); return false; }
-    Serial.println("rec: hdr"); Serial.flush();
-    WavHeader hdr;
-    _wav_file.write((uint8_t*)&hdr, sizeof(hdr));
+    if (_rec_task_handle) {
+        Serial.printf("[MIC][T+%lums] ERROR: already recording (task handle != NULL)\n", millis());
+        return false;
+    }
+    if (!_audio_buf) {
+        Serial.printf("[MIC][T+%lums] ERROR: no PSRAM buffer — call mic_init() first\n", millis());
+        return false;
+    }
+
+    _audio_buf_pos = 0;
 
     if (!_i2s_started) {
-        Serial.println("rec: i2s begin"); Serial.flush();
-        _i2s.setPinsPdmRx(I2S_CLK_PIN, I2S_DATA_PIN);
+        Serial.printf("[MIC][T+%lums] I2S first init: setPinsPdmRx(CLK=%d, DATA=%d)\n",
+                      millis(), PDM_CLK_PIN, PDM_DATA_PIN);
+        _i2s.setPinsPdmRx(PDM_CLK_PIN, PDM_DATA_PIN);
+
+        Serial.printf("[MIC][T+%lums] I2S begin(PDM_RX, %dHz, 16bit, MONO)...\n",
+                      millis(), SAMPLE_RATE);
         if (!_i2s.begin(I2S_MODE_PDM_RX, SAMPLE_RATE,
                         I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO)) {
-            Serial.println("I2S begin failed");
-            _wav_file.close();
+            Serial.printf("[MIC][T+%lums] I2S begin FAILED. Check mic is soldered.\n", millis());
             return false;
         }
         _i2s_started = true;
-        Serial.println("rec: i2s ok"); Serial.flush();
+        Serial.printf("[MIC][T+%lums] I2S init OK.\n", millis());
+    } else {
+        Serial.printf("[MIC][T+%lums] I2S already init — reusing.\n", millis());
     }
 
-    _recording = true;
-    Serial.println("Recording started"); Serial.flush();
-
-    xTaskCreatePinnedToCore(_i2s_record_task, "i2s_rec", 8192, NULL, 1, &_task_handle, 0);
+    _stop_requested = false;
+    BaseType_t ret = xTaskCreatePinnedToCore(
+        _i2s_record_task, "i2s_rec",
+        8192, NULL, 1, &_rec_task_handle, 0  // Core 0 — 8KB: I2S driver uses ~3KB internally
+    );
+    if (ret != pdPASS) {
+        Serial.printf("[MIC][T+%lums] xTaskCreate FAILED (ret=%d)\n", millis(), ret);
+        return false;
+    }
+    Serial.printf("[MIC][T+%lums] Recording task launched on Core 0.\n", millis());
     return true;
 }
 
 extern "C" void stop_i2s_recording() {
-    _stop_requested = true;
+    Serial.printf("[MIC][T+%lums] stop_i2s_recording() — signalling task...\n", millis());
+    if (_rec_task_handle) {
+        _stop_requested = true;
+    } else {
+        Serial.printf("[MIC][T+%lums] WARNING: stop called but no active task.\n", millis());
+    }
 }
 
 extern "C" bool is_recording() {
-    return _recording;
+    return _rec_task_handle != NULL;
+}
+
+extern "C" uint8_t* get_audio_buffer() {
+    return _audio_buf;
+}
+
+extern "C" size_t get_audio_buffer_size() {
+    return _audio_buf_pos;
 }

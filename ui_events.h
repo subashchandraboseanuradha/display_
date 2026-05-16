@@ -10,7 +10,12 @@
 extern "C" {
 #endif
 
+#include <stdint.h>
+
 void on_record_toggle(lv_event_t * e);
+void ui_log_event(const char* msg);
+void ui_log_event_v(const char* fmt, ...);
+uint32_t ui_get_millis(void); // C bridge for Arduino millis()
 
 #ifdef __cplusplus
 } /*extern "C"*/
