@@ -83,7 +83,7 @@ bool cam_init() {
     // Sensor tweaks after init
     sensor_t* s = esp_camera_sensor_get();
     if (s) {
-        s->set_hmirror(s, 1);         // 1 = mirror on (corrects OV5640 natural flip)
+        s->set_hmirror(s, 0);         // 0 = no mirror
         s->set_vflip(s, 1);           // 1 = vertical flip (adjust if upside-down)
         s->set_special_effect(s, 0);  // normal filter
         s->set_gain_ctrl(s, 1);       // auto gain (AGC)
