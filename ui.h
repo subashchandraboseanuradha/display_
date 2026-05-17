@@ -25,28 +25,6 @@ extern "C" {
 #include "ui_helpers.h"
 #include "ui_events.h"
 
-///////////////////// SCREENS ////////////////////
-
-#include "ui_Screen1.h"
-#include "ui_Screen2.h"
-
-///////////////////// VARIABLES ////////////////////
-
-
-// EVENTS
-
-extern lv_obj_t * ui____initial_actions0;
-
-// IMAGES AND IMAGE SETS
-LV_IMG_DECLARE(ui_img_forward_png);    // assets/forward.png
-LV_IMG_DECLARE(ui_img_voice_png);    // assets/voice.png
-LV_IMG_DECLARE(ui_img_stopcircle_png);    // assets/stopcircle.png
-LV_IMG_DECLARE(ui_img_backward_png);    // assets/backward.png
-
-// UI INIT
-void ui_init(void);
-void ui_destroy(void);
-
 #ifdef __cplusplus
 } /*extern "C"*/
 #endif

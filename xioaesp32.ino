@@ -227,18 +227,21 @@ static void enterDeepSleep() {
     digitalWrite(43, LOW);  // backlight off
 
     // EXT0 is level-triggered (LOW=wake). If TOUCH_INT is still LOW
-    // (touch IC holds INT asserted until data is read), ESP32 wakes instantly.
-    // Drain any pending touch read, then wait for pin to idle HIGH.
+    // (CHSC6X holds INT asserted until touch data is read), ESP32 wakes instantly.
+    // Use library drain + CHSC6X I2C (addr 0x2E) to clear the interrupt line.
     pinMode(GPIO_TOUCH_INT, INPUT);
     uint32_t t = millis();
     while (digitalRead(GPIO_TOUCH_INT) == LOW && millis() - t < 3000) {
-        Wire.beginTransmission(0x15); // CST816S address
-        Wire.write(0x01);
+        chsc6x_is_pressed();           // reads IC, clears INT as side-effect
+        Wire.beginTransmission(0x2E);  // CHSC6X address
+        Wire.write(0x00);
         Wire.endTransmission(false);
-        Wire.requestFrom(0x15, 7);
+        Wire.requestFrom(0x2E, 5);
         while (Wire.available()) Wire.read();
         delay(20);
     }
+    Serial.printf("[SLEEP] INT pin=%d after drain (%lums waited)\n",
+                  digitalRead(GPIO_TOUCH_INT), millis() - t);
 
     esp_sleep_enable_ext0_wakeup(GPIO_TOUCH_INT, 0);
     esp_deep_sleep_start();
@@ -1224,8 +1227,8 @@ void loop() {
 
         // ── IDLE ─────────────────────────────────────────────────────────────
         case IDLE:
-            if (now - s_last_activity > IDLE_SLEEP_MS)
-                enterDeepSleep();
+            // sleep disabled — INT drain unreliable, causes instant-wake loop
+            // if (now - s_last_activity > IDLE_SLEEP_MS) enterDeepSleep();
             if (tevt == T_TAP && now - s_timer > 400) {
                 s_timer = now;
                 int tap_x = (int)s_swipe_last_x;
