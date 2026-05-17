@@ -4,10 +4,11 @@
 
 #define PDM_CLK_PIN   42
 #define PDM_DATA_PIN  41
-#define SAMPLE_RATE   16000
+#define SAMPLE_RATE   8000   // 8kHz = telephone quality, half the data vs 16kHz
 #define BIT_DEPTH     16
 #define BYTES_PER_SEC (SAMPLE_RATE * (BIT_DEPTH / 8))  // 32000
 #define BUF_BYTES     (2 * 1024 * 1024)                // 2MB = ~65s
+#define MAX_REC_BYTES (20 * BYTES_PER_SEC)             // 20s cap — 320KB @ 8kHz fits marginal connections
 
 static volatile bool _stop_requested  = false;
 static TaskHandle_t  _rec_task_handle = NULL;
@@ -38,6 +39,10 @@ static void _i2s_record_task(void* param) {
             } else {
                 Serial.printf("[MIC][T+%lums] Buffer FULL at %u bytes — auto-stop.\n",
                               millis(), (unsigned)_audio_buf_pos);
+                break;
+            }
+            if (_audio_buf_pos >= MAX_REC_BYTES) {
+                Serial.printf("[MIC][T+%lums] 30s cap reached — auto-stop.\n", millis());
                 break;
             }
         } else {
@@ -154,4 +159,8 @@ extern "C" uint8_t* get_audio_buffer() {
 
 extern "C" size_t get_audio_buffer_size() {
     return _audio_buf_pos;
+}
+
+extern "C" uint32_t get_bytes_per_sec() {
+    return BYTES_PER_SEC;
 }

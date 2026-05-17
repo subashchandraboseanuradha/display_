@@ -867,6 +867,117 @@ void uiDeleteConfirm(const char* label) {
     tft.drawCentreString("TAP AGAIN TO CONFIRM", 120, 145, 1);
 }
 
+// ── Pending audio: save failed transcriptions, retry on next WiFi ─────────────
+
+static int s_pending_count = 0;
+
+static void scanPendingAudio() {
+    s_pending_count = 0;
+    for (int i = 1; i <= 99; i++) {
+        char p[28];
+        snprintf(p, sizeof(p), "/pending_%03d.wav", i);
+        if (SD.exists(p)) { s_pending_count++; continue; }
+        snprintf(p, sizeof(p), "/pending_%03d.raw", i);
+        if (SD.exists(p)) { s_pending_count++; continue; }
+        break;
+    }
+    if (s_pending_count > 0)
+        Serial.printf("[PEND] %d pending audio file(s) on SD.\n", s_pending_count);
+}
+
+static void writeWavHeader(File& f, uint32_t pcm_bytes) {
+    uint32_t sr        = get_bytes_per_sec() / 2; // bytes_per_sec = sr*2, so sr = bps/2
+    uint16_t ch        = 1;
+    uint16_t bits      = 16;
+    uint16_t align     = ch * bits / 8;
+    uint32_t byte_rate = sr * align;
+    uint32_t data_size = pcm_bytes;
+    uint32_t riff_size = 36 + data_size;
+
+    f.write((const uint8_t*)"RIFF", 4);
+    f.write((uint8_t*)&riff_size, 4);
+    f.write((const uint8_t*)"WAVE", 4);
+    f.write((const uint8_t*)"fmt ", 4);
+    uint32_t fmt_len = 16; f.write((uint8_t*)&fmt_len, 4);
+    uint16_t pcm_type = 1; f.write((uint8_t*)&pcm_type, 2);
+    f.write((uint8_t*)&ch, 2);
+    f.write((uint8_t*)&sr, 4);
+    f.write((uint8_t*)&byte_rate, 4);
+    f.write((uint8_t*)&align, 2);
+    f.write((uint8_t*)&bits, 2);
+    f.write((const uint8_t*)"data", 4);
+    f.write((uint8_t*)&data_size, 4);
+}
+
+static void savePendingAudio(const uint8_t* buf, size_t size) {
+    int slot = 0;
+    for (int i = 1; i <= 99; i++) {
+        char p[28]; snprintf(p, sizeof(p), "/pending_%03d.wav", i);
+        if (!SD.exists(p)) { slot = i; break; }
+    }
+    if (slot == 0) { Serial.println("[PEND] No slot (99 max)"); return; }
+    char path[28]; snprintf(path, sizeof(path), "/pending_%03d.wav", slot);
+    File f = SD.open(path, FILE_WRITE);
+    if (f) {
+        writeWavHeader(f, (uint32_t)size);
+        f.write(buf, size);
+        f.close();
+        s_pending_count++;
+        Serial.printf("[PEND] Saved %u bytes → %s\n", (unsigned)(size + 44), path);
+    } else {
+        Serial.printf("[PEND] FAILED to open %s\n", path);
+    }
+}
+
+static void retryPendingNotes() {
+    if (WiFi.status() != WL_CONNECTED || s_pending_count == 0) return;
+    Serial.printf("[PEND] Retrying %d pending file(s)...\n", s_pending_count);
+    for (int i = 1; i <= 99; i++) {
+        char path[28];
+        bool is_wav = true;
+        snprintf(path, sizeof(path), "/pending_%03d.wav", i);
+        if (!SD.exists(path)) {
+            snprintf(path, sizeof(path), "/pending_%03d.raw", i);
+            if (!SD.exists(path)) continue;
+            is_wav = false;
+        }
+        File f = SD.open(path, FILE_READ);
+        if (!f) continue;
+        size_t fsize = f.size();
+        uint8_t* buf = (uint8_t*)ps_malloc(fsize);
+        if (!buf) { f.close(); Serial.println("[PEND] OOM"); continue; }
+        f.read(buf, fsize);
+        f.close();
+
+        // WAV: skip 44-byte header. RAW: send as-is.
+        const uint8_t* pcm = is_wav ? buf + 44 : buf;
+        size_t pcm_size    = is_wav ? fsize - 44 : fsize;
+        float secs = (float)pcm_size / get_bytes_per_sec();
+        Serial.printf("[PEND] Retrying %s (%.1fs)...\n", path, secs);
+        uiStatus("Recovering idea...", path + 1, TFT_YELLOW);
+
+        char transcript[640] = {0};
+        bool ok = deepgram_transcribe(pcm, pcm_size, transcript, sizeof(transcript) - 1);
+        free(buf);
+
+        if (ok && strlen(transcript) > 0) {
+            s_note_counter++;
+            s_note_count++;
+            saveNote(s_note_counter, transcript);
+            SD.remove(path);
+            s_pending_count--;
+            int cached = min(s_note_count, MAX_NOTES_CACHE);
+            for (int r = cached - 1; r > 0; r--)
+                memcpy(s_previews[r], s_previews[r-1], PREVIEW_CHARS + 1);
+            strncpy(s_previews[0], transcript, PREVIEW_CHARS);
+            s_previews[0][PREVIEW_CHARS] = '\0';
+            Serial.printf("[PEND] Recovered → note_%03d\n", s_note_counter);
+        } else {
+            Serial.printf("[PEND] Still failed — keeping %s for next time.\n", path);
+        }
+    }
+}
+
 // ── Notes: SD helpers ─────────────────────────────────────────────────────────
 
 static void loadAllPreviews() {
@@ -1193,6 +1304,7 @@ void setup() {
     scanAndLoadNotes();
     cam_scan_photos();
     scanAndLoadWords();
+    scanPendingAudio();
     sd_release();
 
     if (!from_sleep) {
@@ -1202,6 +1314,11 @@ void setup() {
         tft.drawCentreString(sb, 120, 140, 2);
         delay(700);
         wifiConnect();
+        if (s_wifi_ok && s_pending_count > 0) {
+            sd_reinit(tft.getSPIinstance());
+            retryPendingNotes();
+            sd_release();
+        }
     } else {
         // Wake from sleep: reconnect WiFi in background, don't block UI
         WiFi.begin();
@@ -1316,7 +1433,7 @@ void loop() {
         case WAITING_STOP:
             if (!is_recording()) {
                 size_t bytes = get_audio_buffer_size();
-                float  secs  = bytes / 32000.0f;
+                float  secs  = (float)bytes / get_bytes_per_sec();
                 Serial.printf("[MAIN] Captured %.1fs (%u bytes)\n", secs, (unsigned)bytes);
                 if (bytes < 16000) {
                     uiStatus("Too short", "tap to try again", TFT_ORANGE);
@@ -1357,7 +1474,10 @@ void loop() {
                 s_state = LIST_VIEW;
                 uiNotesList();
             } else {
-                uiStatus("No transcript", "tap to retry", TFT_RED);
+                sd_reinit(tft.getSPIinstance());
+                savePendingAudio(get_audio_buffer(), get_audio_buffer_size());
+                sd_release();
+                uiStatus("Saved for retry", "will upload later", TFT_YELLOW);
                 delay(2500); uiIdle(); s_state = IDLE;
             }
             s_timer = millis();

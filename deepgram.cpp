@@ -7,7 +7,7 @@
 
 // Deepgram pre-recorded API — raw PCM, no WAV header needed
 #define DG_URL "https://api.deepgram.com/v1/listen" \
-               "?encoding=linear16&sample_rate=16000&channels=1" \
+               "?encoding=linear16&sample_rate=8000&channels=1" \
                "&model=nova-2&language=en"
 
 bool deepgram_transcribe(const uint8_t* pcm_data, size_t pcm_size,
@@ -38,7 +38,7 @@ bool deepgram_transcribe(const uint8_t* pcm_data, size_t pcm_size,
     {
         HTTPClient http;
         http.begin(*sc, DG_URL);
-        http.setTimeout(25000);
+        http.setTimeout(60000);  // 60s — large payload on slow WiFi needs headroom
         http.addHeader("Authorization", "Token " DEEPGRAM_API_KEY);
         http.addHeader("Content-Type",  "audio/raw");
 

@@ -23,6 +23,9 @@ bool is_recording(void);
 uint8_t* get_audio_buffer(void);
 size_t   get_audio_buffer_size(void);
 
+// Bytes per second of recorded audio (sample_rate * bytes_per_sample * channels).
+uint32_t get_bytes_per_sec(void);
+
 #ifdef __cplusplus
 }
 #endif
