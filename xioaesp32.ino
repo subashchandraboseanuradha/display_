@@ -166,57 +166,115 @@ int checkTouch() {
 void uiIdle() {
     tft.fillScreen(TFT_BLACK);
 
-    // 2×2 app icon grid — each tile 82×82, 4px gap at centre
-    const uint16_t C_REC = DL_SURFACE; // unified dark tile (accent shown via icon/label)
-    const uint16_t C_CAM = DL_SURFACE;
-    const uint16_t C_NOT = DL_SURFACE;
-    const uint16_t C_DIC = DL_SURFACE;
-    const int TW = 82, TH = 82;
-    const int T1X=28, T1Y=22;  // RECORD  top-left
-    const int T2X=130,T2Y=22;  // CAMERA  top-right
-    const int T3X=28, T3Y=132; // NOTES   bottom-left
-    const int T4X=130,T4Y=132; // DICT    bottom-right
+    const int TW=84, TH=84, R=14;
+    const int T1X=27,  T1Y=20;   // Record   top-left
+    const int T2X=129, T2Y=20;   // Camera   top-right
+    const int T3X=27,  T3Y=130;  // Ideas    bottom-left
+    const int T4X=129, T4Y=130;  // Dict     bottom-right
 
-    // ── RECORD ── dark tile + blue accent icon + label ──────
-    tft.fillRoundRect(T1X, T1Y, TW, TH, 14, DL_SURFACE);
-    tft.fillRoundRect(T1X+30, T1Y+6,  22, 34, 11, DL_REC);  // mic body
-    tft.drawArc(T1X+41, T1Y+40, 21, 13, 180, 360, DL_REC, DL_SURFACE);
-    tft.fillRect(T1X+40, T1Y+60, 2, 8,  DL_REC);             // stem
-    tft.fillRect(T1X+32, T1Y+68, 18, 2, DL_REC);             // base
-    tft.setTextFont(1); tft.setTextColor(DL_REC, DL_SURFACE);
-    tft.drawCentreString("RECORD", T1X+41, T1Y+73, 1);
+    // ── RECORD ──────────────────────────────────────────────────
+    tft.fillRoundRect(T1X, T1Y, TW, TH, R, DL_SURFACE);
+    tft.drawRoundRect(T1X, T1Y, TW, TH, R, DL_REC);
+    { int mx=T1X+42, my=T1Y+18;
+      tft.fillRoundRect(mx-9, my,    18, 26, 9, DL_REC);       // mic capsule
+      tft.drawArc(mx, my+26, 16, 10, 180, 360, DL_REC, DL_SURFACE); // stand arc
+      tft.fillRect(mx-1, my+42, 2,  6, DL_REC);                // stem
+      tft.fillRoundRect(mx-8, my+47, 16, 3, 1, DL_REC); }     // base
+    tft.setTextColor(TFT_WHITE, DL_SURFACE);
+    tft.drawCentreString("Record", T1X+42, T1Y+66, 2);
 
-    // ── CAMERA ── dark tile + emerald accent ─────────────────
-    tft.fillRoundRect(T2X, T2Y, TW, TH, 14, DL_SURFACE);
-    tft.fillRoundRect(T2X+6, T2Y+22, 70, 36, 5, DL_CAM);    // body
-    { int lx=T2X+41, ly=T2Y+40;
-      tft.fillCircle(lx, ly, 12, DL_SURFACE);
-      tft.drawCircle(lx, ly, 12, DL_CAM);
-      tft.fillCircle(lx, ly,  6, DL_CAM); }                  // lens rings
-    tft.fillRoundRect(T2X+56, T2Y+16, 14, 7, 3, DL_CAM);    // notch
-    tft.setTextFont(1); tft.setTextColor(DL_CAM, DL_SURFACE);
-    tft.drawCentreString("CAMERA", T2X+41, T2Y+73, 1);
+    // ── CAMERA ──────────────────────────────────────────────────
+    tft.fillRoundRect(T2X, T2Y, TW, TH, R, DL_SURFACE);
+    tft.drawRoundRect(T2X, T2Y, TW, TH, R, DL_CAM);
+    { int cx=T2X+42, cy=T2Y+36;
+      tft.fillRoundRect(cx-26, cy-12, 52, 28, 4, DL_CAM);      // body
+      tft.fillRoundRect(cx+14, cy-18,  8,  6, 2, DL_CAM);      // bump
+      tft.fillCircle(cx, cy, 9, DL_SURFACE);                    // lens hole
+      tft.drawCircle(cx, cy, 9, DL_CAM);
+      tft.fillCircle(cx, cy, 5, DL_CAM);                        // inner lens
+      tft.fillCircle(cx-3, cy-3, 2, DL_SURFACE); }             // glint
+    tft.setTextColor(TFT_WHITE, DL_SURFACE);
+    tft.drawCentreString("Camera", T2X+42, T2Y+66, 2);
 
-    // ── NOTES ── dark tile + amber accent ────────────────────
-    tft.fillRoundRect(T3X, T3Y, TW, TH, 14, DL_SURFACE);
-    for (int i = 0; i < 4; i++)
-        tft.fillRect(T3X+12, T3Y+10+i*14, 58, 2, DL_NOT);   // ruled lines
-    tft.setTextFont(1); tft.setTextColor(DL_NOT, DL_SURFACE);
-    char nlabel[16] = "NOTES";
-    if (s_note_count > 0) snprintf(nlabel, sizeof(nlabel), "NOTES(%d)", s_note_count);
-    tft.drawCentreString(nlabel, T3X+41, T3Y+73, 1);
+    // ── IDEAS (NOTES) ────────────────────────────────────────────
+    tft.fillRoundRect(T3X, T3Y, TW, TH, R, DL_SURFACE);
+    tft.drawRoundRect(T3X, T3Y, TW, TH, R, DL_NOT);
+    { int nx=T3X+42, ny=T3Y+16;
+      tft.fillRoundRect(nx-16, ny,    32, 38, 3, DL_NOT);       // page
+      for (int i=0; i<3; i++)                                    // ruled lines
+          tft.fillRect(nx-10, ny+8+i*9, 20, 2, DL_SURFACE); }
+    tft.setTextColor(TFT_WHITE, DL_SURFACE);
+    char nlabel[16];
+    if (s_note_count > 0) snprintf(nlabel, sizeof(nlabel), "Ideas (%d)", s_note_count);
+    else strcpy(nlabel, "Ideas");
+    tft.drawCentreString(nlabel, T3X+42, T3Y+66, 2);
 
-    // ── DICT ── dark tile + violet accent ────────────────────
-    tft.fillRoundRect(T4X, T4Y, TW, TH, 14, DL_SURFACE);
-    tft.setTextColor(DL_DIC, DL_SURFACE);
-    tft.drawCentreString("A", T4X+41, T4Y+12, 4);            // large letter
-    tft.setTextFont(1); tft.setTextColor(DL_DIC, DL_SURFACE);
-    char dlabel[16] = "DICT";
-    if (s_word_count > 0) snprintf(dlabel, sizeof(dlabel), "DICT(%d)", s_word_count);
-    tft.drawCentreString(dlabel, T4X+41, T4Y+73, 1);
+    // ── DICT ────────────────────────────────────────────────────
+    tft.fillRoundRect(T4X, T4Y, TW, TH, R, DL_SURFACE);
+    tft.drawRoundRect(T4X, T4Y, TW, TH, R, DL_DIC);
+    { int bx=T4X+42, by=T4Y+18;
+      tft.fillRoundRect(bx-20, by,    18, 26, 2, DL_DIC);       // left page
+      tft.fillRoundRect(bx+2,  by,    18, 26, 2, DL_DIC);       // right page
+      tft.fillRect(bx-2, by, 4, 26, DL_SURFACE);                // spine
+      for (int i=0; i<3; i++) {                                  // text lines
+          tft.fillRect(bx-18, by+5+i*7, 12, 2, DL_SURFACE);
+          tft.fillRect(bx+6,  by+5+i*7, 12, 2, DL_SURFACE); } }
+    tft.setTextColor(TFT_WHITE, DL_SURFACE);
+    char dlabel[16];
+    if (s_word_count > 0) snprintf(dlabel, sizeof(dlabel), "Dict (%d)", s_word_count);
+    else strcpy(dlabel, "Dict");
+    tft.drawCentreString(dlabel, T4X+42, T4Y+66, 2);
 
-    // WiFi indicator dot at gap centre
-    tft.fillCircle(120, 117, 5, WiFi.status() == WL_CONNECTED ? DL_WIFI_ON : DL_WIFI_OFF);
+    // ── WiFi indicator ───────────────────────────────────────────
+    bool wcon = (WiFi.status() == WL_CONNECTED);
+    uint16_t wc = wcon ? DL_WIFI_ON : DL_WIFI_OFF;
+    tft.fillCircle(120, 117, 5, wc);
+    if (wcon) tft.drawCircle(120, 117, 8, wc);
+}
+
+static void uiBootSplash() {
+    tft.fillScreen(TFT_BLACK);
+
+    // ── Phase 1: ring expands from center ─────────────────────
+    for (int r = 1; r <= 108; r++) {
+        tft.drawCircle(120, 120, r,     0xFFFF);  // bright front
+        if (r > 3)  tft.drawCircle(120, 120, r-3, 0x4208);  // dim trail
+        if (r > 7)  tft.drawCircle(120, 120, r-7, TFT_BLACK); // erase tail
+        delay(4);
+    }
+    for (int r = 102; r <= 116; r++) tft.drawCircle(120, 120, r, TFT_BLACK);
+
+    delay(100);
+
+    // ── Phase 2: text fades in ─────────────────────────────────
+    // White shades (dark→bright)
+    uint16_t wh[] = {0x2104, 0x4208, 0x7BEF, 0xAD55, 0xD6BA, 0xFFFF};
+    // Gold shades for "Subash"
+    uint16_t gd[] = {0x41A0, 0x6340, 0x8BE0, 0xBCE0, 0xE5A0, 0xFEA0};
+
+    // "designed with love"
+    for (int i = 0; i < 6; i++) {
+        tft.setTextColor(wh[i], TFT_BLACK);
+        tft.drawCentreString("designed with love", 120, 98, 2);
+        delay(45);
+    }
+    delay(120);
+
+    // "Subash" in gold
+    for (int i = 0; i < 6; i++) {
+        tft.setTextColor(gd[i], TFT_BLACK);
+        tft.drawCentreString("Subash", 120, 122, 4);
+        delay(55);
+    }
+
+    // ── Phase 3: hold ─────────────────────────────────────────
+    delay(1600);
+
+    // ── Phase 4: black circle wipes from center ───────────────
+    for (int r = 0; r <= 125; r += 3) {
+        tft.fillCircle(120, 120, r, TFT_BLACK);
+        delay(5);
+    }
 }
 
 static void enterDeepSleep() {
@@ -1287,7 +1345,7 @@ void setup() {
     Serial.printf("[MAIN] Display OK.\n");
 
     if (!from_sleep) {
-        // Cold boot: show splash + block on WiFi
+        uiBootSplash();
         tft.fillScreen(TFT_BLACK);
         tft.setTextColor(TFT_WHITE, TFT_BLACK);
         tft.drawCentreString("Checking SD...", 120, 108, 2);
