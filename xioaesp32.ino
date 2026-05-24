@@ -164,72 +164,85 @@ int checkTouch() {
 // ── Display: Screen 1 ────────────────────────────────────────────────────────
 
 void uiIdle() {
-    tft.fillScreen(TFT_BLACK);
+    tft.fillScreen(DL_BG);
 
-    const int TW=84, TH=84, R=14;
+    const int TW=84, TH=84, R=16;
     const int T1X=27,  T1Y=20;   // Record   top-left
     const int T2X=129, T2Y=20;   // Camera   top-right
     const int T3X=27,  T3Y=130;  // Ideas    bottom-left
     const int T4X=129, T4Y=130;  // Dict     bottom-right
 
+    // Per-app dark-tinted backgrounds — near-black with a colour hint
+    const uint16_t BG_REC = 0x0006;   // deep blue
+    const uint16_t BG_CAM = 0x00C2;   // deep teal
+    const uint16_t BG_NOT = 0x1840;   // deep amber
+    const uint16_t BG_DIC = 0x1803;   // deep violet
+
     // ── RECORD ──────────────────────────────────────────────────
-    tft.fillRoundRect(T1X, T1Y, TW, TH, R, DL_SURFACE);
-    tft.drawRoundRect(T1X, T1Y, TW, TH, R, DL_REC);
-    { int mx=T1X+42, my=T1Y+18;
-      tft.fillRoundRect(mx-9, my,    18, 26, 9, DL_REC);       // mic capsule
-      tft.drawArc(mx, my+26, 16, 10, 180, 360, DL_REC, DL_SURFACE); // stand arc
-      tft.fillRect(mx-1, my+42, 2,  6, DL_REC);                // stem
-      tft.fillRoundRect(mx-8, my+47, 16, 3, 1, DL_REC); }     // base
-    tft.setTextColor(TFT_WHITE, DL_SURFACE);
+    tft.fillRoundRect(T1X, T1Y, TW, TH, R, BG_REC);
+    tft.drawRoundRect(T1X,   T1Y,   TW,   TH,   R,   DL_REC);
+    tft.drawRoundRect(T1X+1, T1Y+1, TW-2, TH-2, R-1, DL_REC);
+    { int mx=T1X+42, my=T1Y+13;
+      tft.fillRoundRect(mx-11, my, 22, 30, 11, DL_REC);
+      tft.drawArc(mx, my+30, 16, 10, 180, 360, DL_REC, BG_REC);
+      tft.fillRect(mx-1, my+45, 3, 7, DL_REC);
+      tft.fillRoundRect(mx-9, my+51, 18, 4, 2, DL_REC); }
+    tft.setTextColor(DL_REC, BG_REC);
     tft.drawCentreString("Record", T1X+42, T1Y+66, 2);
 
     // ── CAMERA ──────────────────────────────────────────────────
-    tft.fillRoundRect(T2X, T2Y, TW, TH, R, DL_SURFACE);
-    tft.drawRoundRect(T2X, T2Y, TW, TH, R, DL_CAM);
-    { int cx=T2X+42, cy=T2Y+36;
-      tft.fillRoundRect(cx-26, cy-12, 52, 28, 4, DL_CAM);      // body
-      tft.fillRoundRect(cx+14, cy-18,  8,  6, 2, DL_CAM);      // bump
-      tft.fillCircle(cx, cy, 9, DL_SURFACE);                    // lens hole
+    tft.fillRoundRect(T2X, T2Y, TW, TH, R, BG_CAM);
+    tft.drawRoundRect(T2X,   T2Y,   TW,   TH,   R,   DL_CAM);
+    tft.drawRoundRect(T2X+1, T2Y+1, TW-2, TH-2, R-1, DL_CAM);
+    { int cx=T2X+42, cy=T2Y+34;
+      tft.fillRoundRect(cx-24, cy-12, 48, 26, 4, DL_CAM);
+      tft.fillRoundRect(cx+12, cy-18,  9,  8, 2, DL_CAM);
+      tft.fillCircle(cx, cy, 9, BG_CAM);
       tft.drawCircle(cx, cy, 9, DL_CAM);
-      tft.fillCircle(cx, cy, 5, DL_CAM);                        // inner lens
-      tft.fillCircle(cx-3, cy-3, 2, DL_SURFACE); }             // glint
-    tft.setTextColor(TFT_WHITE, DL_SURFACE);
+      tft.fillCircle(cx, cy, 5, DL_CAM);
+      tft.fillCircle(cx-2, cy-2, 2, BG_CAM); }
+    tft.setTextColor(DL_CAM, BG_CAM);
     tft.drawCentreString("Camera", T2X+42, T2Y+66, 2);
 
-    // ── IDEAS (NOTES) ────────────────────────────────────────────
-    tft.fillRoundRect(T3X, T3Y, TW, TH, R, DL_SURFACE);
-    tft.drawRoundRect(T3X, T3Y, TW, TH, R, DL_NOT);
-    { int nx=T3X+42, ny=T3Y+16;
-      tft.fillRoundRect(nx-16, ny,    32, 38, 3, DL_NOT);       // page
-      for (int i=0; i<3; i++)                                    // ruled lines
-          tft.fillRect(nx-10, ny+8+i*9, 20, 2, DL_SURFACE); }
-    tft.setTextColor(TFT_WHITE, DL_SURFACE);
+    // ── IDEAS ────────────────────────────────────────────────────
+    tft.fillRoundRect(T3X, T3Y, TW, TH, R, BG_NOT);
+    tft.drawRoundRect(T3X,   T3Y,   TW,   TH,   R,   DL_NOT);
+    tft.drawRoundRect(T3X+1, T3Y+1, TW-2, TH-2, R-1, DL_NOT);
+    { int nx=T3X+42, ny=T3Y+14;
+      tft.fillRoundRect(nx-14, ny, 28, 36, 3, DL_NOT);
+      for (int i=0; i<4; i++)
+          tft.fillRect(nx-9, ny+7+i*7, 18, 2, BG_NOT); }
+    tft.setTextColor(DL_NOT, BG_NOT);
     char nlabel[16];
     if (s_note_count > 0) snprintf(nlabel, sizeof(nlabel), "Ideas (%d)", s_note_count);
     else strcpy(nlabel, "Ideas");
     tft.drawCentreString(nlabel, T3X+42, T3Y+66, 2);
 
     // ── DICT ────────────────────────────────────────────────────
-    tft.fillRoundRect(T4X, T4Y, TW, TH, R, DL_SURFACE);
-    tft.drawRoundRect(T4X, T4Y, TW, TH, R, DL_DIC);
-    { int bx=T4X+42, by=T4Y+18;
-      tft.fillRoundRect(bx-20, by,    18, 26, 2, DL_DIC);       // left page
-      tft.fillRoundRect(bx+2,  by,    18, 26, 2, DL_DIC);       // right page
-      tft.fillRect(bx-2, by, 4, 26, DL_SURFACE);                // spine
-      for (int i=0; i<3; i++) {                                  // text lines
-          tft.fillRect(bx-18, by+5+i*7, 12, 2, DL_SURFACE);
-          tft.fillRect(bx+6,  by+5+i*7, 12, 2, DL_SURFACE); } }
-    tft.setTextColor(TFT_WHITE, DL_SURFACE);
+    tft.fillRoundRect(T4X, T4Y, TW, TH, R, BG_DIC);
+    tft.drawRoundRect(T4X,   T4Y,   TW,   TH,   R,   DL_DIC);
+    tft.drawRoundRect(T4X+1, T4Y+1, TW-2, TH-2, R-1, DL_DIC);
+    { int bx=T4X+42, by=T4Y+16;
+      tft.fillRoundRect(bx-18, by, 16, 26, 2, DL_DIC);
+      tft.fillRoundRect(bx+2,  by, 16, 26, 2, DL_DIC);
+      tft.fillRect(bx-2, by, 4, 26, BG_DIC);
+      for (int i=0; i<3; i++) {
+          tft.fillRect(bx-16, by+5+i*7, 10, 2, BG_DIC);
+          tft.fillRect(bx+6,  by+5+i*7, 10, 2, BG_DIC); } }
+    tft.setTextColor(DL_DIC, BG_DIC);
     char dlabel[16];
     if (s_word_count > 0) snprintf(dlabel, sizeof(dlabel), "Dict (%d)", s_word_count);
     else strcpy(dlabel, "Dict");
     tft.drawCentreString(dlabel, T4X+42, T4Y+66, 2);
 
-    // ── WiFi indicator ───────────────────────────────────────────
+    // ── WiFi indicator — center gap ───────────────────────────────
     bool wcon = (WiFi.status() == WL_CONNECTED);
-    uint16_t wc = wcon ? DL_WIFI_ON : DL_WIFI_OFF;
+    uint16_t wc = wcon ? DL_WIFI_ON : DL_TEXT3;
     tft.fillCircle(120, 117, 5, wc);
-    if (wcon) tft.drawCircle(120, 117, 8, wc);
+    if (wcon) {
+        tft.drawCircle(120, 117, 8,  wc);
+        tft.drawCircle(120, 117, 11, DL_SURFACE);
+    }
 }
 
 static void uiBootSplash() {
@@ -306,24 +319,44 @@ static void enterDeepSleep() {
 }
 
 void uiRecording(uint32_t elapsed_ms) {
-    tft.fillScreen(TFT_BLACK);
-    tft.fillCircle(120, 120, 95, TFT_RED);
-    tft.setTextColor(TFT_WHITE, TFT_RED);
-    tft.drawCentreString("REC", 120, 85, 4);
-    char t[10];
+    tft.fillScreen(DL_BG);
+
+    // Outer progress ring — track + elapsed fill
+    int prog = min((int)((long)elapsed_ms * 360 / 20000), 360);
+    tft.drawArc(120, 120, 108, 100, 0, 360, DL_SURFACE2, DL_BG);
+    if (prog > 0) tft.drawArc(120, 120, 108, 100, 0, prog, DL_ERR, DL_BG);
+
+    // Pulsing REC dot (alternates each second)
+    bool pulse = (elapsed_ms / 1000) % 2 == 0;
+    tft.fillCircle(120, 82, 5, pulse ? DL_ERR : DL_SURFACE2);
+
+    // REC label + timer
+    tft.setTextColor(DL_ERR, DL_BG);
+    tft.drawCentreString("REC", 120, 94, 4);
     uint32_t s = elapsed_ms / 1000;
+    char t[10];
     snprintf(t, sizeof(t), "%02lu:%02lu", s / 60, s % 60);
+    tft.setTextColor(DL_TEXT1, DL_BG);
     tft.drawCentreString(t, 120, 130, 4);
-    tft.drawCentreString("tap to stop", 120, 168, 2);
+
+    // Remaining time
+    int remaining = max(0, 20 - (int)(elapsed_ms / 1000));
+    char rem[10]; snprintf(rem, sizeof(rem), "-%ds", remaining);
+    tft.setTextColor(DL_TEXT3, DL_BG);
+    tft.drawCentreString(rem, 120, 163, 2);
+
+    tft.setTextColor(DL_TEXT2, DL_BG);
+    tft.drawCentreString("tap to stop", 120, 196, 2);
 }
 
-void uiStatus(const char* line1, const char* line2, uint16_t col = TFT_WHITE) {
-    tft.fillScreen(TFT_BLACK);
-    tft.setTextColor(col, TFT_BLACK);
-    tft.drawCentreString(line1, 120, 102, 2);
+void uiStatus(const char* line1, const char* line2, uint16_t col = DL_TEXT1) {
+    tft.fillScreen(DL_BG);
+    tft.drawArc(120, 76, 22, 15, 0, 270, col, DL_BG);   // 3/4-circle loading arc
+    tft.setTextColor(col, DL_BG);
+    tft.drawCentreString(line1, 120, 110, 2);
     if (line2) {
-        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-        tft.drawCentreString(line2, 120, 128, 2);
+        tft.setTextColor(DL_TEXT3, DL_BG);
+        tft.drawCentreString(line2, 120, 132, 2);
     }
 }
 
@@ -336,63 +369,56 @@ void uiStatus(const char* line1, const char* line2, uint16_t col = TFT_WHITE) {
 #define LIST_VISIBLE 5
 
 void uiNotesList() {
-    tft.fillScreen(TFT_BLACK);
+    tft.fillScreen(DL_BG);
 
-    // Header — tap = IDLE
-    tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    // Header
+    tft.setTextColor(DL_NOT, DL_BG);
     char hdr[20];
     snprintf(hdr, sizeof(hdr), "IDEAS  (%d)", s_note_count);
     tft.drawCentreString(hdr, 120, 9, 2);
-    // up arrow if scrolled down
     if (s_scroll_top > 0) {
-        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-        tft.drawString("\x1e", 210, 9, 2); // ▲ fallback: just show hint
+        tft.setTextColor(DL_TEXT3, DL_BG);
         tft.drawCentreString("^", 215, 8, 2);
     }
-    tft.drawFastHLine(25, 23, 190, TFT_CYAN);
+    tft.drawFastHLine(25, 23, 190, DL_NOT);
 
     int visible = min(LIST_VISIBLE, s_note_count - s_scroll_top);
     for (int i = 0; i < visible; i++) {
-        int rank   = s_scroll_top + i;         // 0 = newest
-        int num    = s_note_count - rank;       // actual note number
-        int y      = LIST_START_Y + i * LIST_ITEM_H;
+        int rank = s_scroll_top + i;
+        int num  = s_note_count - rank;
+        int y    = LIST_START_Y + i * LIST_ITEM_H;
 
-        // Note number (small, cyan)
+        // Card background
+        tft.fillRect(28, y, 184, LIST_ITEM_H - 2, DL_SURFACE);
+
+        // Badge (amber, small)
         tft.setTextFont(1);
-        tft.setTextColor(TFT_CYAN, TFT_BLACK);
-        char badge[8];
-        snprintf(badge, sizeof(badge), "IDEA %d", num);
-        tft.drawString(badge, 35, y + 1);
+        tft.setTextColor(DL_NOT, DL_SURFACE);
+        char badge[8]; snprintf(badge, sizeof(badge), "IDEA %d", num);
+        tft.drawString(badge, 35, y + 2);
 
-        // Preview (one line, white)
+        // Preview text
         tft.setTextFont(2);
-        tft.setTextColor(TFT_WHITE, TFT_BLACK);
+        tft.setTextColor(DL_TEXT1, DL_SURFACE);
         char prev[PREVIEW_CHARS + 4];
         strncpy(prev, s_previews[rank], PREVIEW_CHARS);
         prev[PREVIEW_CHARS] = '\0';
-        // append "…" if note was truncated in cache
         if (strlen(s_previews[rank]) >= PREVIEW_CHARS) {
             prev[PREVIEW_CHARS - 2] = '.';
             prev[PREVIEW_CHARS - 1] = '.';
         }
-        tft.drawString(prev, 35, y + 12);
-
-        // Divider
-        if (i < visible - 1)
-            tft.drawFastHLine(35, y + LIST_ITEM_H - 1, 170, 0x2104);
+        tft.drawString(prev, 35, y + 14);
     }
 
-    // Scroll hint: more notes below
     if (s_scroll_top + LIST_VISIBLE < s_note_count) {
-        tft.drawFastHLine(25, 196, 190, 0x2104);
+        tft.drawFastHLine(25, 196, 190, DL_LINE);
         tft.setTextFont(1);
-        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.setTextColor(DL_TEXT3, DL_BG);
         tft.drawCentreString("swipe up for more", 120, 202, 1);
     }
 
-    // Footer hint
     tft.setTextFont(1);
-    tft.setTextColor(0x2104, TFT_BLACK);
+    tft.setTextColor(DL_LINE, DL_BG);
     tft.drawCentreString("tap header = record new", 120, 218, 1);
 }
 
@@ -485,105 +511,101 @@ void uiNoteDetail(int rank, const char* text, int scroll = 0) {
 // ── Display: Screen 3 — camera ───────────────────────────────────────────────
 
 void uiCamera(bool cam_ok) {
-    tft.fillScreen(TFT_BLACK);
-    // Viewfinder circle
-    tft.drawCircle(120, 100, 75, 0x39E7);   // dim grey ring
-    tft.drawCircle(120, 100, 74, 0x39E7);
-    // Corner marks
+    tft.fillScreen(DL_BG);
+    // Viewfinder ring (double for weight)
+    tft.drawCircle(120, 100, 75, DL_TEXT3);
+    tft.drawCircle(120, 100, 74, DL_LINE);
+    // Corner focus marks
     for (int a = 0; a < 360; a += 90) {
         float r = a * 3.14159f / 180.0f;
         int cx = 120 + (int)(65 * cosf(r));
         int cy = 100 + (int)(65 * sinf(r));
-        tft.fillCircle(cx, cy, 3, TFT_WHITE);
+        tft.fillCircle(cx, cy, 3, DL_CAM);
     }
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
     if (cam_ok) {
+        tft.setTextColor(DL_TEXT1, DL_BG);
         tft.drawCentreString("TAP TO SHOOT", 120, 185, 2);
         if (s_photo_count > 0) {
-            tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+            tft.setTextColor(DL_TEXT3, DL_BG);
             char buf[24];
             snprintf(buf, sizeof(buf), "%d photo%s  swipe left",
                      s_photo_count, s_photo_count == 1 ? "" : "s");
             tft.drawCentreString(buf, 120, 208, 1);
         }
     } else {
-        tft.setTextColor(TFT_RED, TFT_BLACK);
+        tft.setTextColor(DL_ERR, DL_BG);
         tft.drawCentreString("Camera failed", 120, 185, 2);
-        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.setTextColor(DL_TEXT3, DL_BG);
         tft.drawCentreString("check expansion board", 120, 208, 1);
     }
-    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    tft.setTextColor(DL_TEXT3, DL_BG);
     tft.drawCentreString("swipe right = back", 120, 222, 1);
 }
 
 void uiPhotoGallery(int scroll_top) {
-    tft.fillScreen(TFT_BLACK);
+    tft.fillScreen(DL_BG);
 
-    tft.setTextColor(TFT_GREEN, TFT_BLACK);
+    tft.setTextColor(DL_CAM, DL_BG);
     char hdr[20];
     snprintf(hdr, sizeof(hdr), "PHOTOS  (%d)", s_photo_count);
     tft.drawCentreString(hdr, 120, 9, 2);
     if (scroll_top > 0) {
-        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.setTextColor(DL_TEXT3, DL_BG);
         tft.drawCentreString("^", 215, 8, 2);
     }
-    tft.drawFastHLine(25, 23, 190, TFT_GREEN);
+    tft.drawFastHLine(25, 23, 190, DL_CAM);
 
     int visible = min(LIST_VISIBLE, s_photo_count - scroll_top);
     for (int i = 0; i < visible; i++) {
-        int num = s_photo_count - scroll_top - i;  // newest first
+        int num = s_photo_count - scroll_top - i;
         int y   = LIST_START_Y + i * LIST_ITEM_H;
 
+        tft.fillRect(28, y, 184, LIST_ITEM_H - 2, DL_SURFACE);
+
         tft.setTextFont(1);
-        tft.setTextColor(TFT_GREEN, TFT_BLACK);
+        tft.setTextColor(DL_CAM, DL_SURFACE);
         char badge[16];
         snprintf(badge, sizeof(badge), "PHOTO %d", num);
-        tft.drawString(badge, 35, y + 1);
+        tft.drawString(badge, 35, y + 2);
 
         tft.setTextFont(2);
-        tft.setTextColor(TFT_WHITE, TFT_BLACK);
-        tft.drawString("/photo_", 35, y + 12);
-        char num_s[8];
-        snprintf(num_s, sizeof(num_s), "%03d.jpg", num);
-        tft.drawString(num_s, 90, y + 12);
-
-        if (i < visible - 1)
-            tft.drawFastHLine(35, y + LIST_ITEM_H - 1, 170, 0x2104);
+        tft.setTextColor(DL_TEXT1, DL_SURFACE);
+        char fname[20]; snprintf(fname, sizeof(fname), "/photo_%03d.jpg", num);
+        tft.drawString(fname, 35, y + 14);
     }
 
     if (scroll_top + LIST_VISIBLE < s_photo_count) {
-        tft.drawFastHLine(25, 196, 190, 0x2104);
+        tft.drawFastHLine(25, 196, 190, DL_LINE);
         tft.setTextFont(1);
-        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.setTextColor(DL_TEXT3, DL_BG);
         tft.drawCentreString("swipe up for more", 120, 202, 1);
     }
     tft.setTextFont(1);
-    tft.setTextColor(0x2104, TFT_BLACK);
+    tft.setTextColor(DL_LINE, DL_BG);
     tft.drawCentreString("tap = view  |  swipe right = camera", 120, 218, 1);
 }
 
 void uiPhotoLoading(int num) {
-    tft.fillScreen(TFT_BLACK);
-    tft.setTextColor(TFT_GREEN, TFT_BLACK);
-    char buf[20];
-    snprintf(buf, sizeof(buf), "Loading photo %d...", num);
+    tft.fillScreen(DL_BG);
+    tft.drawArc(120, 76, 22, 15, 0, 270, DL_CAM, DL_BG);
+    tft.setTextColor(DL_CAM, DL_BG);
+    char buf[20]; snprintf(buf, sizeof(buf), "Loading photo %d...", num);
     tft.drawCentreString(buf, 120, 110, 2);
 }
 
 void uiPhotoDetailOverlay(int num, int total) {
     // Overlay header + footer on top of the displayed photo
     // (photo already drawn full-screen by cam_view_photo)
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setTextColor(DL_TEXT1, DL_BG);
     tft.setTextFont(1);
     char buf[20];
     snprintf(buf, sizeof(buf), " PHOTO %d / %d ", num, total);
     tft.setCursor(2, 2);
     tft.print(buf);
-    // Footer within circle safe zone
-    tft.drawFastHLine(40, 203, 160, 0x2104);
-    tft.setTextColor(TFT_WHITE);
+    tft.drawFastHLine(40, 203, 160, DL_LINE);
+    tft.setTextColor(DL_TEXT2);
     tft.setCursor(44, 210); tft.print("< BACK");
-    tft.setTextColor(TFT_RED);
+    tft.setTextColor(DL_ERR);
     tft.setCursor(148, 210); tft.print("[ DELETE ]");
 }
 
@@ -601,64 +623,60 @@ static bool  s_scan_done        = false;
 static int   s_prev_state       = IDLE;  // state to return to when closing panel
 
 void uiWifiPanel(bool scanning) {
-    tft.fillScreen(TFT_BLACK);
+    tft.fillScreen(DL_BG);
 
     // Header
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setTextColor(DL_TEXT1, DL_BG);
     tft.drawCentreString("WiFi Settings", 120, 10, 2);
-    tft.drawFastHLine(25, 26, 190, TFT_WHITE);
+    tft.drawFastHLine(25, 26, 190, DL_LINE);
 
-    // Current status
     bool connected = (WiFi.status() == WL_CONNECTED);
     tft.setTextFont(1);
     if (connected) {
-        tft.setTextColor(TFT_GREEN, TFT_BLACK);
+        tft.setTextColor(DL_OK, DL_BG);
         tft.drawCentreString(WiFi.SSID().c_str(), 120, 32, 2);
         char ipbuf[20];
         WiFi.localIP().toString().toCharArray(ipbuf, sizeof(ipbuf));
-        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.setTextColor(DL_TEXT3, DL_BG);
         tft.drawCentreString(ipbuf, 120, 50, 1);
     } else {
-        tft.setTextColor(TFT_RED, TFT_BLACK);
+        tft.setTextColor(DL_ERR, DL_BG);
         tft.drawCentreString("Not connected", 120, 38, 2);
     }
 
-    tft.drawFastHLine(25, 62, 190, 0x2104);
+    tft.drawFastHLine(25, 62, 190, DL_LINE);
 
     if (scanning) {
-        tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+        tft.setTextColor(DL_WARN, DL_BG);
         tft.drawCentreString("Scanning...", 120, 108, 2);
         return;
     }
 
-    // Saved networks — show match status
     tft.setTextFont(2);
     int y = 70;
     for (int i = 0; i < SAVED_COUNT; i++) {
         if (strlen(SAVED_SSIDS[i]) == 0) continue;
         bool in_range   = false;
         bool is_current = connected && (WiFi.SSID() == String(SAVED_SSIDS[i]));
-        // Check scan results
         for (int j = 0; j < s_scan_count; j++) {
             if (strcmp(s_scan_ssid[j], SAVED_SSIDS[i]) == 0) { in_range = true; break; }
         }
         if (is_current) {
-            tft.setTextColor(TFT_GREEN, TFT_BLACK);
-            tft.drawString("✓ ", 30, y);
+            tft.setTextColor(DL_OK, DL_BG);
+            tft.drawString("+ ", 30, y);
         } else if (in_range) {
-            tft.setTextColor(TFT_WHITE, TFT_BLACK);
-            tft.drawString("→ ", 30, y);
+            tft.setTextColor(DL_TEXT1, DL_BG);
+            tft.drawString("> ", 30, y);
         } else {
-            tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-            tft.drawString("✗ ", 30, y);
+            tft.setTextColor(DL_TEXT3, DL_BG);
+            tft.drawString("- ", 30, y);
         }
-        // Truncate SSID to fit
         char ssid_short[22];
         strncpy(ssid_short, SAVED_SSIDS[i], 21);
         ssid_short[21] = '\0';
         tft.drawString(ssid_short, 50, y);
         if (!is_current && in_range) {
-            tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+            tft.setTextColor(DL_TEXT3, DL_BG);
             tft.setTextFont(1);
             tft.drawString("tap to connect", 50, y + 17);
             tft.setTextFont(2);
@@ -669,14 +687,14 @@ void uiWifiPanel(bool scanning) {
     }
 
     if (s_scan_count == 0 && s_scan_done) {
-        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.setTextColor(DL_TEXT3, DL_BG);
         tft.drawCentreString("No saved networks in range", 120, 140, 1);
         tft.drawCentreString("Add SSIDs to secrets.h", 120, 155, 1);
     }
 
-    tft.drawFastHLine(25, 195, 190, 0x2104);
+    tft.drawFastHLine(25, 195, 190, DL_LINE);
     tft.setTextFont(1);
-    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    tft.setTextColor(DL_TEXT3, DL_BG);
     tft.drawCentreString("tap = connect  |  swipe up = close", 120, 201, 1);
     tft.drawCentreString("New network? Add to secrets.h", 120, 215, 1);
 }
@@ -769,34 +787,37 @@ int kb_tap(int tap_x, int tap_y) {
 }
 
 void uiDictListening(uint32_t elapsed_ms) {
-    tft.fillScreen(TFT_BLACK);
-    tft.fillCircle(120, 100, 55, 0x0010);
-    tft.drawCircle(120, 100, 55, TFT_WHITE);
-    tft.fillRoundRect(111, 76, 18, 36, 9, TFT_WHITE);
-    tft.drawArc(120, 112, 22, 16, 180, 360, TFT_WHITE, TFT_BLACK);
-    tft.drawFastVLine(120, 128, 8, TFT_WHITE);
-    tft.drawFastHLine(110, 136, 20, TFT_WHITE);
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.fillScreen(DL_BG);
+    bool pulse = (elapsed_ms / 600) % 2 == 0;
+    uint16_t ring_col = pulse ? DL_DIC : DL_SURFACE2;
+    tft.fillCircle(120, 100, 55, DL_SURFACE);
+    tft.drawCircle(120, 100, 55, ring_col);
+    tft.drawCircle(120, 100, 54, ring_col);
+    tft.fillRoundRect(111, 76, 18, 36, 9, DL_DIC);
+    tft.drawArc(120, 112, 22, 16, 180, 360, DL_DIC, DL_SURFACE);
+    tft.drawFastVLine(120, 128, 8, DL_DIC);
+    tft.drawFastHLine(110, 136, 20, DL_DIC);
+    tft.setTextColor(DL_DIC, DL_BG);
     tft.drawCentreString("LISTENING...", 120, 165, 2);
-    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    tft.setTextColor(DL_TEXT3, DL_BG);
     tft.drawCentreString("tap to stop", 120, 190, 2);
     tft.drawCentreString("(say one word)", 120, 210, 1);
 }
 
 void uiDictResult(const char* definition, bool found, int rank = -1, int total = 0) {
-    tft.fillScreen(TFT_BLACK);
+    tft.fillScreen(DL_BG);
     // Position indicator top-right: "2/5" when browsing saved words
     if (total > 1 && rank >= 0) {
         char pos_ind[12];
         snprintf(pos_ind, sizeof(pos_ind), "%d/%d", rank + 1, total);
         tft.setTextFont(1);
-        tft.setTextColor(0x39E7, TFT_BLACK);
+        tft.setTextColor(DL_TEXT2, DL_BG);
         tft.drawString(pos_ind, 195, 5);
     }
     if (!found) {
-        tft.setTextColor(TFT_RED, TFT_BLACK);
+        tft.setTextColor(DL_ERR, DL_BG);
         tft.drawCentreString("Word not found", 120, 95, 4);
-        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.setTextColor(DL_TEXT3, DL_BG);
         tft.drawCentreString("Check spelling", 120, 128, 2);
         tft.drawCentreString("tap = try again", 120, 155, 2);
         return;
@@ -820,63 +841,60 @@ void uiDictResult(const char* definition, bool found, int rank = -1, int total =
     }
 
     // Header: WORD (large) + pos (small)
-    tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    tft.setTextColor(DL_DIC, DL_BG);
     char wup[48]; int wi=0;
     for (; word[wi]; wi++) wup[wi]=toupper(word[wi]); wup[wi]='\0';
     tft.drawCentreString(wup, 120, 10, 4);
-    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    tft.setTextColor(DL_TEXT3, DL_BG);
     tft.drawCentreString(pos, 120, 42, 2);
-    tft.drawFastHLine(28, 56, 184, TFT_CYAN);
+    tft.drawFastHLine(28, 56, 184, DL_DIC);
 
-    // Definition in white
-    int def_bottom = drawWrappedTextEx(def, 28, 60, 184, TFT_WHITE);
+    int def_bottom = drawWrappedTextEx(def, 28, 60, 184, DL_TEXT1);
 
-    // Example in dimmer colour if present
     if (strlen(eg) > 0) {
-        tft.drawFastHLine(28, def_bottom + 2, 184, 0x2104);
-        drawWrappedTextEx(eg, 28, def_bottom + 6, 184, 0x7BEF); // dim grey
+        tft.drawFastHLine(28, def_bottom + 2, 184, DL_LINE);
+        drawWrappedTextEx(eg, 28, def_bottom + 6, 184, DL_TEXT3);
     }
 
-    // Footer: within circle at y=210
-    tft.drawFastHLine(38, 203, 164, 0x2104);
+    tft.drawFastHLine(38, 203, 164, DL_LINE);
     tft.setTextFont(1);
-    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    tft.setTextColor(DL_TEXT3, DL_BG);
     tft.setCursor(42,  210); tft.print("tap=new");
-    tft.setTextColor(0xFD20, TFT_BLACK);
+    tft.setTextColor(DL_NOT, DL_BG);
     tft.setCursor(108, 210); tft.print("up=vocab");
-    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    tft.setTextColor(DL_TEXT3, DL_BG);
     tft.setCursor(168, 210); tft.print("dn=X");
 }
 
 void uiWordList(int scroll_top) {
-    tft.fillScreen(TFT_BLACK);
-    tft.setTextColor(0xFD20, TFT_BLACK); // amber
+    tft.fillScreen(DL_BG);
+    tft.setTextColor(DL_DIC, DL_BG);
     char hdr[22];
     snprintf(hdr, sizeof(hdr), "VOCAB (%d)", s_word_count);
     tft.drawCentreString(hdr, 120, 9, 2);
-    if (scroll_top > 0) { tft.setTextColor(TFT_DARKGREY, TFT_BLACK); tft.drawCentreString("^", 215, 8, 2); }
-    tft.drawFastHLine(25, 23, 190, 0xFD20);
+    if (scroll_top > 0) { tft.setTextColor(DL_TEXT3, DL_BG); tft.drawCentreString("^", 215, 8, 2); }
+    tft.drawFastHLine(25, 23, 190, DL_DIC);
 
     int visible = min(LIST_VISIBLE, s_word_count - scroll_top);
     for (int i = 0; i < visible; i++) {
-        int rank = scroll_top + i;               // 0 = newest
+        int rank = scroll_top + i;
         int num  = s_word_count - rank;
         int y    = LIST_START_Y + i * LIST_ITEM_H;
+        tft.fillRect(28, y, 184, LIST_ITEM_H - 2, DL_SURFACE);
         tft.setTextFont(1);
-        tft.setTextColor(0xFD20, TFT_BLACK);
+        tft.setTextColor(DL_DIC, DL_SURFACE);
         char badge[8]; snprintf(badge, sizeof(badge), "#%d", num);
-        tft.drawString(badge, 35, y + 1);
+        tft.drawString(badge, 35, y + 2);
         tft.setTextFont(2);
-        tft.setTextColor(TFT_WHITE, TFT_BLACK);
-        tft.drawString(s_word_previews[rank], 58, y + 10);
-        if (i < visible - 1) tft.drawFastHLine(35, y + LIST_ITEM_H - 1, 170, 0x2104);
+        tft.setTextColor(DL_TEXT1, DL_SURFACE);
+        tft.drawString(s_word_previews[rank], 58, y + 12);
     }
     if (scroll_top + LIST_VISIBLE < s_word_count) {
-        tft.drawFastHLine(25, 196, 190, 0x2104);
-        tft.setTextFont(1); tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.drawFastHLine(25, 196, 190, DL_LINE);
+        tft.setTextFont(1); tft.setTextColor(DL_TEXT3, DL_BG);
         tft.drawCentreString("swipe up for more", 120, 202, 1);
     }
-    tft.setTextFont(1); tft.setTextColor(0x2104, TFT_BLACK);
+    tft.setTextFont(1); tft.setTextColor(DL_LINE, DL_BG);
     tft.drawCentreString("tap = detail  |  swipe right = close", 120, 218, 1);
 }
 
@@ -1012,7 +1030,7 @@ static void retryPendingNotes() {
         size_t pcm_size    = is_wav ? fsize - 44 : fsize;
         float secs = (float)pcm_size / get_bytes_per_sec();
         Serial.printf("[PEND] Retrying %s (%.1fs)...\n", path, secs);
-        uiStatus("Recovering idea...", path + 1, TFT_YELLOW);
+        uiStatus("Recovering idea...", path + 1, DL_WARN);
 
         char transcript[640] = {0};
         bool ok = deepgram_transcribe(pcm, pcm_size, transcript, sizeof(transcript) - 1);
@@ -1269,9 +1287,9 @@ static void wifiConnect() {
 
     // Scan once to find which saved network is in range
     tft.fillScreen(TFT_BLACK);
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setTextColor(DL_TEXT1, DL_BG);
     tft.drawCentreString("Connecting WiFi", 120, 105, 2);
-    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    tft.setTextColor(DL_TEXT3, DL_BG);
     tft.drawCentreString("Scanning...", 120, 128, 1);
 
     int n = WiFi.scanNetworks(false, false);
@@ -1291,14 +1309,14 @@ static void wifiConnect() {
     if (best_saved < 0) {
         s_wifi_ok = false;
         Serial.println("[WiFi] FAILED — offline");
-        tft.setTextColor(TFT_RED, TFT_BLACK);
+        tft.setTextColor(DL_ERR, DL_BG);
         tft.drawCentreString("WiFi FAILED", 120, 147, 2);
         delay(1000);
         return;
     }
 
-    tft.fillRect(0, 120, 240, 30, TFT_BLACK);
-    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    tft.fillRect(0, 120, 240, 30, DL_BG);
+    tft.setTextColor(DL_TEXT3, DL_BG);
     tft.drawCentreString(SAVED_SSIDS[best_saved], 120, 128, 1);
 
     WiFi.begin(SAVED_SSIDS[best_saved], SAVED_PASS[best_saved]);
@@ -1306,7 +1324,7 @@ static void wifiConnect() {
     uint8_t dots = 0;
     while (WiFi.status() != WL_CONNECTED && millis() - t < 15000) {
         delay(500);
-        tft.fillRect(95, 145, 50, 14, TFT_BLACK);
+        tft.fillRect(95, 145, 50, 14, DL_BG);
         char d[8] = {0};
         for (uint8_t i = 0; i < dots % 4; i++) d[i] = '.';
         tft.drawCentreString(d, 120, 147, 2);
@@ -1315,12 +1333,12 @@ static void wifiConnect() {
     if (WiFi.status() == WL_CONNECTED) {
         s_wifi_ok = true;
         Serial.printf("[WiFi] %s\n", WiFi.localIP().toString().c_str());
-        tft.setTextColor(TFT_GREEN, TFT_BLACK);
+        tft.setTextColor(DL_OK, DL_BG);
         tft.drawCentreString("WiFi OK", 120, 147, 2);
     } else {
         s_wifi_ok = false;
         Serial.println("[WiFi] FAILED — offline");
-        tft.setTextColor(TFT_RED, TFT_BLACK);
+        tft.setTextColor(DL_ERR, DL_BG);
         tft.drawCentreString("WiFi FAILED", 120, 147, 2);
     }
     delay(1000);
@@ -1347,14 +1365,14 @@ void setup() {
     if (!from_sleep) {
         uiBootSplash();
         tft.fillScreen(TFT_BLACK);
-        tft.setTextColor(TFT_WHITE, TFT_BLACK);
+        tft.setTextColor(DL_TEXT1, DL_BG);
         tft.drawCentreString("Checking SD...", 120, 108, 2);
     }
 
     bool sd_ok = init_sd_card(tft.getSPIinstance());
     if (!sd_ok) {
-        tft.fillScreen(TFT_BLACK);
-        tft.setTextColor(TFT_RED, TFT_BLACK);
+        tft.fillScreen(DL_BG);
+        tft.setTextColor(DL_ERR, DL_BG);
         tft.drawCentreString("SD FAILED", 120, 140, 4);
         while (true) delay(1000);
     }
@@ -1366,7 +1384,7 @@ void setup() {
     sd_release();
 
     if (!from_sleep) {
-        tft.setTextColor(TFT_GREEN, TFT_BLACK);
+        tft.setTextColor(DL_OK, DL_BG);
         char sb[36];
         snprintf(sb, sizeof(sb), "SD OK — %d ideas / %d photos", s_note_count, s_photo_count);
         tft.drawCentreString(sb, 120, 140, 2);
@@ -1421,7 +1439,7 @@ void loop() {
                         }
                     } else {
                         // ── CAMERA icon (top-right) ───────────────────────
-                        uiStatus("Starting camera...", nullptr, TFT_GREEN);
+                        uiStatus("Starting camera...", nullptr, DL_CAM);
                         bool cam_ok = cam_init();
                         s_state = CAMERA_VIEW;
                         uiCamera(cam_ok);
@@ -1450,7 +1468,7 @@ void loop() {
             // Swipe right → camera
             if (tevt == T_SWIPE_RIGHT && now - s_timer > 400) {
                 s_timer = now;
-                uiStatus("Starting camera...", nullptr, TFT_GREEN);
+                uiStatus("Starting camera...", nullptr, DL_CAM);
                 bool cam_ok = cam_init();
                 s_state = CAMERA_VIEW;
                 uiCamera(cam_ok);
@@ -1482,7 +1500,7 @@ void loop() {
             if (tevt == T_TAP && now - s_timer > 1200) {
                 s_timer = now;
                 stop_i2s_recording();
-                uiStatus("Stopping...", nullptr, TFT_YELLOW);
+                uiStatus("Stopping...", nullptr, DL_WARN);
                 s_state = WAITING_STOP;
             }
             break;
@@ -1535,7 +1553,7 @@ void loop() {
                 sd_reinit(tft.getSPIinstance());
                 savePendingAudio(get_audio_buffer(), get_audio_buffer_size());
                 sd_release();
-                uiStatus("Saved for retry", "will upload later", TFT_YELLOW);
+                uiStatus("Saved for retry", "will upload later", DL_WARN);
                 delay(2500); uiIdle(); s_state = IDLE;
             }
             s_timer = millis();
@@ -1725,7 +1743,7 @@ void loop() {
                 }
 
                 // ── CAPTURE ──────────────────────────────────────────────────
-                uiStatus("Capturing...", nullptr, TFT_GREEN);
+                uiStatus("Capturing...", nullptr, DL_CAM);
                 bool ok = cam_capture_save(tft.getSPIinstance());
                 if (ok) {
                     // Flash
@@ -1733,7 +1751,7 @@ void loop() {
                     delay(60);
                     char msg[24];
                     snprintf(msg, sizeof(msg), "Photo %d saved!", s_photo_counter);
-                    uiStatus(msg, "tap to shoot again", TFT_GREEN);
+                    uiStatus(msg, "tap to shoot again", DL_CAM);
                     delay(1500);
                 } else {
                     uiStatus("Capture failed", nullptr, TFT_RED);
@@ -1946,7 +1964,7 @@ void loop() {
                     }
                     if (tapped_idx >= 0) {
                         Serial.printf("[WiFi] Connecting to %s...\n", SAVED_SSIDS[tapped_idx]);
-                        uiStatus("Connecting...", SAVED_SSIDS[tapped_idx], TFT_YELLOW);
+                        uiStatus("Connecting...", SAVED_SSIDS[tapped_idx], DL_WARN);
                         WiFi.disconnect();
                         WiFi.begin(SAVED_SSIDS[tapped_idx], SAVED_PASS[tapped_idx]);
                         uint32_t t = millis();
@@ -1996,7 +2014,7 @@ void loop() {
                 } else if (action == 2) {
                     // GO / Search
                     if (s_kb_len > 0) {
-                        uiStatus("Looking up...", s_kb_input, TFT_CYAN);
+                        uiStatus("Looking up...", s_kb_input, DL_DIC);
                         char word_buf[48];
                         strncpy(word_buf, s_kb_input, 47); word_buf[47] = '\0';
                         bool found = dict_lookup(word_buf, s_transcript, sizeof(s_transcript)-1);
@@ -2031,7 +2049,7 @@ void loop() {
             }
             if ((tevt == T_TAP && now - s_timer > 800) || (now - s_rec_start > 4000)) {
                 stop_i2s_recording();
-                uiStatus("Transcribing...", nullptr, TFT_CYAN);
+                uiStatus("Transcribing...", nullptr, DL_REC);
                 s_state = DICT_FETCH;
                 s_timer = now;
             }
@@ -2046,7 +2064,7 @@ void loop() {
                     s_transcript, sizeof(s_transcript) - 1);
                 if (ok && strlen(s_transcript) > 0) {
                     Serial.printf("[DICT] Word heard: \"%s\"\n", s_transcript);
-                    uiStatus("Looking up...", s_transcript, TFT_CYAN);
+                    uiStatus("Looking up...", s_transcript, DL_DIC);
                     char word_buf[48];
                     strncpy(word_buf, s_transcript, 47); word_buf[47] = '\0';
                     bool found = dict_lookup(word_buf, s_transcript, sizeof(s_transcript) - 1);
