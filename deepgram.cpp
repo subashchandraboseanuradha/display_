@@ -11,8 +11,10 @@
                "&model=nova-2&language=en"
 
 bool deepgram_transcribe(const uint8_t* pcm_data, size_t pcm_size,
-                         char* out_transcript, size_t out_max) {
+                         char* out_transcript, size_t out_max,
+                         bool* permanent_fail) {
     out_transcript[0] = '\0';
+    if (permanent_fail) *permanent_fail = false;
 
     if (!pcm_data || pcm_size == 0) {
         Serial.println("[DG] No audio data");
@@ -73,5 +75,10 @@ bool deepgram_transcribe(const uint8_t* pcm_data, size_t pcm_size,
     body.substring(idx, endq).toCharArray(out_transcript, out_max);
     Serial.printf("[DG] Transcript (%d chars): \"%s\"\n",
                   strlen(out_transcript), out_transcript);
+    if (strlen(out_transcript) == 0) {
+        Serial.println("[DG] Empty transcript. DeepGram response:");
+        Serial.println(body.substring(0, 600));
+        if (permanent_fail) *permanent_fail = true;  // HTTP 200 + no speech = unrecoverable
+    }
     return strlen(out_transcript) > 0;
 }

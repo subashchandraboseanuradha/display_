@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <SD.h>
 #include <esp_camera.h>
+#include <esp_err.h>
 #include <img_converters.h>
 #define USE_TFT_ESPI_LIBRARY
 #include <TFT_eSPI.h>
@@ -37,13 +38,19 @@ int s_photo_counter = 0;
 
 static bool _started = false;
 
+// Preview stall tracking — shared between cam_preview_frame() and cam_init()
+// (declared here so cam_init() can reset them on every fresh start).
+static uint32_t _last_good_frame = 0;   // millis() of last successful fb_get, 0 = none yet
+static uint32_t _last_fail_log   = 0;   // throttle repeated failure logs
+static uint32_t _consec_fails    = 0;
+#define CAM_STALL_MS      1500   // no good frame for this long -> self-heal
+#define CAM_FAIL_LOG_MS    250   // don't log every single failed frame
+
 // ── init / deinit ─────────────────────────────────────────────────────────────
 
-bool cam_init() {
-    if (_started) return true;
-
-    Serial.printf("[CAM][T+%lums] Initialising camera...\n", millis());
-
+// Called before each init attempt so cam_init() can retry once on transient
+// failure without duplicating the whole config block.
+static bool cam_init_attempt() {
     camera_config_t cfg;
     cfg.ledc_channel = LEDC_CHANNEL_0;
     cfg.ledc_timer   = LEDC_TIMER_0;
@@ -75,10 +82,19 @@ bool cam_init() {
 
     esp_err_t err = esp_camera_init(&cfg);
     if (err != ESP_OK) {
-        Serial.printf("[CAM] Init FAILED: 0x%x\n", err);
+        Serial.printf("[CAM] esp_camera_init FAILED: %s (0x%x)  freeHeap=%u freePSRAM=%u\n",
+                      esp_err_to_name(err), err,
+                      (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
         return false;
     }
     _started = true;
+    // Fresh start — baseline the stall-clock to now (not 0), so both "never
+    // produced a single frame" and "was fine then stalled" are caught by the
+    // same check, and a stale timestamp from a previous session can't cause
+    // an immediate spurious self-heal on the very first dropped frame.
+    _last_good_frame = millis();
+    _last_fail_log   = 0;
+    _consec_fails    = 0;
 
     // Sensor tweaks after init
     sensor_t* s = esp_camera_sensor_get();
@@ -92,10 +108,44 @@ bool cam_init() {
         s->set_whitebal(s, 1);
         s->set_aec2(s, 1);            // AEC DSP
         s->set_ae_level(s, 0);        // AE compensation
+        // Quality: mild sharpness/saturation lift — sensor default looks a
+        // touch flat/soft on this panel. Setters no-op safely if unsupported.
+        s->set_sharpness(s, 1);
+        s->set_saturation(s, 1);
+        s->set_contrast(s, 1);
     }
 
-    Serial.printf("[CAM][T+%lums] Init OK.\n", millis());
+    Serial.printf("[CAM][T+%lums] Init OK. freeHeap=%u freePSRAM=%u\n",
+                  millis(), (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
     return true;
+}
+
+bool cam_init() {
+    if (_started) return true;
+
+    Serial.printf("[CAM][T+%lums] Initialising camera...\n", millis());
+    if (cam_init_attempt()) return true;
+
+    // Transient SCCB/power-rail hiccups are common right after a previous
+    // deinit — a couple of retries with escalating settle delays clear most
+    // of them. If it still fails every time, on-device logs have shown
+    // ESP_ERR_NOT_SUPPORTED / "Software Reset FAILED" repeating identically
+    // across retries — that pattern points at a marginal physical connection
+    // (camera ribbon/connector on the Sense expansion board), not something
+    // a longer software retry can fix. Log clearly so that's diagnosable.
+    const int settle_ms[] = {300, 600};
+    for (int i = 0; i < 2; i++) {
+        Serial.printf("[CAM] Retrying init (%d/2) after %dms settle...\n", i + 1, settle_ms[i]);
+        delay(settle_ms[i]);
+        if (cam_init_attempt()) {
+            Serial.printf("[CAM] Retry %d succeeded.\n", i + 1);
+            return true;
+        }
+    }
+
+    Serial.println("[CAM] Init FAILED after 3 attempts — likely a hardware/"
+                    "connection issue rather than transient, giving up.");
+    return false;
 }
 
 void cam_deinit() {
@@ -144,10 +194,34 @@ const char* cam_next_filter() {
 
 static bool _preview_logged = false;
 
-void cam_preview_frame() {
-    if (!_started) return;
+bool cam_preview_frame() {
+    if (!_started) return false;
+
     camera_fb_t* fb = esp_camera_fb_get();
-    if (!fb) return;
+    if (!fb) {
+        _consec_fails++;
+        uint32_t now = millis();
+        if (now - _last_fail_log > CAM_FAIL_LOG_MS) {
+            _last_fail_log = now;
+            Serial.printf("[CAM] fb_get FAILED (x%u since last good frame, %lums ago)\n",
+                          (unsigned)_consec_fails, (unsigned long)(now - _last_good_frame));
+        }
+        // Sensor has been stuck long enough that a stale frame is actively
+        // misleading — self-heal instead of leaving a frozen/blank preview.
+        if (now - _last_good_frame > CAM_STALL_MS) {
+            Serial.printf("[CAM] Stalled %lums — reinitialising driver...\n",
+                          (unsigned long)(now - _last_good_frame));
+            cam_deinit();
+            bool ok = cam_init();
+            Serial.printf("[CAM] Self-heal reinit %s\n", ok ? "OK" : "FAILED");
+            _last_good_frame = now;  // reset the stall clock either way
+            _consec_fails = 0;
+        }
+        return false;
+    }
+
+    _last_good_frame = millis();
+    _consec_fails    = 0;
     if (!_preview_logged) {
         Serial.printf("[CAM] Preview frame: %dx%d  %u bytes  fmt=%d\n",
                       fb->width, fb->height, (unsigned)fb->len, fb->format);
@@ -155,9 +229,26 @@ void cam_preview_frame() {
     }
     tft.pushImage(0, 0, fb->width, fb->height, (uint16_t*)fb->buf);
     esp_camera_fb_return(fb);
+    return true;
 }
 
 // ── capture & save ────────────────────────────────────────────────────────────
+
+// A single dropped frame around a capture is usually transient (sensor mid-
+// exposure-adjust) — one quick retry avoids surfacing "Capture failed" for
+// something that would've worked 50ms later.
+static camera_fb_t* cam_fb_get_retry(const char* tag) {
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (fb) return fb;
+    Serial.printf("[CAM] %s: fb_get FAILED, retrying once...\n", tag);
+    delay(50);
+    fb = esp_camera_fb_get();
+    if (!fb) {
+        Serial.printf("[CAM] %s: fb_get FAILED again. freeHeap=%u freePSRAM=%u\n",
+                      tag, (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
+    }
+    return fb;
+}
 
 bool cam_capture_save(SPIClass& spi_bus) {
     if (!_started) { Serial.println("[CAM] Not started"); return false; }
@@ -165,8 +256,8 @@ bool cam_capture_save(SPIClass& spi_bus) {
     Serial.printf("[CAM][T+%lums] Capturing...\n", millis());
     // Brief delay to let AF/AE settle before grabbing frame
     delay(120);
-    camera_fb_t* fb = esp_camera_fb_get();
-    if (!fb) { Serial.println("[CAM] fb_get FAILED"); return false; }
+    camera_fb_t* fb = cam_fb_get_retry("cam_capture_save");
+    if (!fb) return false;
 
     Serial.printf("[CAM] Frame %dx%d, %u bytes, fmt=RGB565\n",
                   fb->width, fb->height, (unsigned)fb->len);
@@ -178,7 +269,8 @@ bool cam_capture_save(SPIClass& spi_bus) {
     esp_camera_fb_return(fb);
 
     if (!converted || !jpeg_buf) {
-        Serial.println("[CAM] frame2jpg FAILED");
+        Serial.printf("[CAM] frame2jpg FAILED. freeHeap=%u freePSRAM=%u\n",
+                      (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
         if (jpeg_buf) free(jpeg_buf);
         return false;
     }
@@ -206,6 +298,31 @@ bool cam_capture_save(SPIClass& spi_bus) {
     sd_release();
     free(jpeg_buf);
     return ok;
+}
+
+// ── capture to memory (no SD) ─────────────────────────────────────────────────
+
+bool cam_capture_to_mem(uint8_t** out_buf, size_t* out_len) {
+    if (!_started) { Serial.println("[CAM] cam_capture_to_mem: not started"); return false; }
+    delay(120);
+    camera_fb_t* fb = cam_fb_get_retry("cam_capture_to_mem");
+    if (!fb) return false;
+
+    uint8_t* jbuf = nullptr;
+    size_t   jlen = 0;
+    bool ok = frame2jpg(fb, 80, &jbuf, &jlen);
+    esp_camera_fb_return(fb);
+
+    if (!ok || !jbuf) {
+        if (jbuf) free(jbuf);
+        Serial.printf("[CAM] cam_capture_to_mem: frame2jpg FAILED. freeHeap=%u freePSRAM=%u\n",
+                      (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
+        return false;
+    }
+    *out_buf = jbuf;
+    *out_len = jlen;
+    Serial.printf("[CAM] cam_capture_to_mem: %u bytes JPEG in PSRAM\n", (unsigned)jlen);
+    return true;
 }
 
 // ── view: load JPEG from SD, decode, draw full-screen ────────────────────────

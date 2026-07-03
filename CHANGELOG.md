@@ -5,6 +5,65 @@
 - Display: Seeed Round Display 1.28" (GC9A01, 240x240, touch CHSC6X)
 - SD card: SENSE board micro SD slot (CS=GPIO21, SPI=GPIO7/8/9 via FSPI)
 - Display SPI (HSPI/SPI3): TFT CS=GPIO7, MOSI=GPIO44, MISO=GPIO43, SCK=GPIO6, DC=GPIO4
+- PCF8563 RTC module + coin cell (added this round) — I2C, shares touch bus GPIO5/6, addr 0x51
+
+---
+
+## [2026-07-04] Paging, AI Art, RTC Clock, Offline Dictionary, Telegram Sync
+
+Large multi-part session — see `README.md` for the current feature list and
+`PROJECT_CONTEXT.md`/design memory for deep architecture notes. Summary:
+
+### Home screen
+- Replaced the fixed 4-tile + center-AI-button layout with a swipeable,
+  paged 2×2 grid (page 1: Record/Camera/Ideas/Dict, page 2: Ask AI/WiFi).
+  The old layout's center button forced corner tiles outside the round
+  glass's safe radius — bleed bug, fixed by the repage.
+- Icons are now AI-generated character mascots (flat 2D, bold color, a
+  face/personality per app) instead of hand-drawn vector shapes, baked in
+  as RGB565 bitmaps (`icon_art.cpp/h`) and blitted with `pushImage()`.
+  Tile background is fixed white (this art style only renders correctly on
+  white — recoloring it onto a dark tile distorted internal shading).
+
+### Idle clock-face screensaver (new)
+- New `rtc.cpp/h`: PCF8563 driver. After 20s of no touch, the icon grid
+  gives way to a ticking clock face (AI-generated character art,
+  `clock_art.cpp/h`, same fixed-white-background reasoning as the icons).
+  NTP re-syncs the RTC on every WiFi connect; the RTC itself is what keeps
+  time, including fully offline.
+
+### Camera stability
+- `cam_preview_frame()` used to silently freeze on a dropped frame with no
+  logging or recovery. Added: failure logging, a 1.5s stall detector that
+  auto re-inits the driver, a retry in `cam_init()` for transient
+  post-deinit failures, and free-heap/PSRAM logging on every failure path.
+  Confirmed via on-device logs that persistent `ESP_ERR_NOT_SUPPORTED`
+  failures survive a full reinit cycle — points at a physical FPC
+  connector issue, not something firmware can retry its way out of.
+
+### Dictionary — offline-first
+- New offline path: `/dict_en.bin` (~1M English entries) and `/dict_ta.bin`
+  (~5K English→Tamil entries), sorted fixed-length binary records on the SD
+  card, looked up via binary search (`sd_binary_search()` in
+  `dictionary.cpp`) — instant, no network. Sourced from kaikki.org's
+  Wiktextract dump (no ready-made offline English→Tamil word dataset exists
+  anywhere else, as far as could be found).
+- Added Merriam-Webster **Collegiate** API as a second online fallback tier
+  (broader coverage than Learner's) before the AI-guessed last resort.
+
+### Mobile sync (Telegram)
+- New `telegram.cpp/h`: notes and photos mirror to a Telegram bot the
+  moment they're saved (WiFi permitting) — hand-built multipart upload for
+  photos (Telegram's Bot API has no base64-in-JSON option for raw bytes).
+  One-time backfill (`backfillTelegramSync()`) pushes everything that
+  existed on the SD card before this feature, marked done via
+  `/tg_synced.flag` so it never repeats.
+
+### Bug fixed along the way
+- Idle-screensaver timer had an unsigned-subtraction underflow
+  (`now - s_last_activity` could wrap to ~4.29 billion when a touch updated
+  the activity timestamp mid-`loop()`-tick) — fired the screensaver
+  immediately instead of after 20s idle. Fixed with a signed cast.
 
 ## Key Architecture Notes
 - TFT uses HSPI (SPI3) routed to GPIO6/43/44 — Seeed_GFX User_Setup.h

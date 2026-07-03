@@ -1,6 +1,13 @@
 # Project Context — Idea Capture Device
 ## XIAO ESP32S3 Sense + Seeed Round Display (GC9A01 240×240)
 
+> **This file is a historical snapshot from the original MVP** (voice-record-
+> only, no SD, no camera, no dictionary — see "Why SD is Not Used" below,
+> which is no longer true). Kept for the low-level pin/SPI/I2S debugging
+> lessons, which are still accurate. **For current features, architecture,
+> and setup, see `README.md`.** For the running history of what's been
+> added since this snapshot, see `CHANGELOG.md`.
+
 ---
 
 ## What This Is

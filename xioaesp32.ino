@@ -35,6 +35,13 @@
 #include "deepgram.h"
 #include "camera.h"
 #include "dictionary.h"
+#include "openrouter.h"
+#include "telegram.h"
+#include "battery.h"
+#include "rtc.h"
+#include "clock_art.h"
+#include "icon_art.h"
+#include "time.h"
 #include "secrets.h"
 
 #define IDLE_SLEEP_MS  60000UL   // 1 min idle → deep sleep
@@ -54,17 +61,27 @@ extern "C" void     ui_log_event_v(const char*, ...) {}
 #define DL_TEXT1     0xFFFF   // primary text  (white)
 #define DL_TEXT2     0xC618   // secondary text            (~#C0C0C0)
 #define DL_TEXT3     0x8410   // hint / tertiary text      (~#808080)
-// App accent colours
+// Always-black ink for fixed-white surfaces (home-tile labels, clock hands).
+// These surfaces stay white regardless of the app's dark theme (the AI
+// character art only reads correctly on white — verified on-device), so
+// DL_TEXT1 (which flips to white in this theme) would be invisible on them.
+#define DL_INK_FIXED 0x0000
+// App accent colours — used for icon-tile label text (on the fixed-white
+// tile background) and various headers/accents elsewhere. Icon glyphs
+// themselves are AI-generated bitmaps (icon_art.h), each already baked in
+// its own bold color, not drawn with these at runtime.
 #define DL_REC       0x3C1F   // record  — steel blue      (~#3981FF)
 #define DL_CAM       0x15D0   // camera  — emerald         (~#10BA84)
 #define DL_NOT       0xF4E1   // notes   — warm amber      (~#F79E08)
 #define DL_DIC       0x8B1E   // dict    — soft violet     (~#8B61F7)
+#define DL_WIFI      0x269D   // wifi    — bright cyan     (~#20D0E8)
 // Semantic
 #define DL_OK        0x07E0   // success green
 #define DL_WARN      0xFDE0   // warning yellow
 #define DL_ERR       0xF800   // error / delete red
 #define DL_WIFI_ON   0x07E0   // WiFi connected
 #define DL_WIFI_OFF  0x8410   // WiFi disconnected
+#define DL_ASK       0xFEA0   // AI Ask — warm gold
 
 // ── States ────────────────────────────────────────────────────────────────────
 #define IDLE          0
@@ -83,8 +100,16 @@ extern "C" void     ui_log_event_v(const char*, ...) {}
 #define DICT_RESULT  13   // showing result
 #define WORD_LIST    14   // saved vocabulary list
 #define WORD_DETAIL  15   // full word definition
+#define ASK_HOME     16   // AI Ask: choose photo+voice or voice-only
+#define ASK_CAM      17   // live preview — tap to capture photo for AI
+#define ASK_VOICE    18   // recording the question
+#define ASK_THINK    19   // transcribe + OpenRouter call (blocking)
+#define ASK_RESULT   20   // display AI answer (scrollable)
+#define IDLE_CLOCK   21   // idle screensaver — clock face, shown after inactivity
 static int      s_state = IDLE;
 static uint32_t s_timer = 0;
+
+#define CLOCK_IDLE_MS 20000UL   // inactivity before the clock-face screensaver shows
 
 // ── Notes ─────────────────────────────────────────────────────────────────────
 #define MAX_NOTES_CACHE 60
@@ -100,6 +125,15 @@ static int  s_detail_rank    = 0;     // which rank to show in detail (0=newest)
 static int  s_detail_scroll  = 0;     // lines scrolled in detail view
 static bool s_delete_pending = false; // waiting for second tap to confirm delete
 static char s_transcript[640];
+static int  s_home_page   = 0;        // 0 = Record/Camera/Ideas/Dict, 1 = Ask/WiFi
+static bool s_rtc_ok      = false;    // PCF8563 present on the I2C bus
+
+// ── AI Ask globals ────────────────────────────────────────────────────────────
+static uint8_t* s_ask_jpeg      = nullptr;  // PSRAM JPEG from camera (caller frees)
+static size_t   s_ask_jpg_sz    = 0;
+static bool     s_ask_has_photo = false;
+static char     s_ask_result[800] = {0};    // AI answer text
+static int      s_ask_scroll    = 0;        // scroll offset in ASK_RESULT view
 
 // Preview cache: rank 0 = newest note, rank 1 = second newest, …
 static char s_previews[MAX_NOTES_CACHE][PREVIEW_CHARS + 1];
@@ -126,6 +160,14 @@ int checkTouch() {
         s_last_activity = millis();  // any physical contact resets idle timer
         lv_coord_t x = 0, y = 0;
         chsc6x_get_xy(&x, &y);
+        // chsc6x reports raw panel coords, ignoring tft.setRotation(1) (90° CW).
+        // Remap so taps still land on the icon the user sees: (x,y) -> (y, 240-x).
+        if (x != 0 || y != 0) {
+            lv_coord_t rawx = x, rawy = y;
+            lv_coord_t rx = y, ry = 240 - x;
+            x = rx; y = ry;
+            Serial.printf("[TOUCH] raw(%d,%d) -> remapped(%d,%d)\n", rawx, rawy, x, y);
+        }
         if (x != 0 || y != 0) {
             if (!s_touch_prev) {
                 s_swipe_start_x = x; s_swipe_start_y = y;
@@ -163,99 +205,158 @@ int checkTouch() {
 
 // ── Display: Screen 1 ────────────────────────────────────────────────────────
 
+// Small battery gauge, top-centre of round screen (circle-safe band y=14..26).
+void drawBatteryIcon() {
+    uint32_t mv  = battery_read_mv();
+    int      pct = battery_read_percent();
+    Serial.printf("[BAT] %lu mV  %d%%\n", (unsigned long)mv, pct);
+
+    const int BW = 26, BH = 12;
+    const int BX = 120 - (BW + 2) / 2, BY = 14;  // centred at x=120
+    uint16_t col = (pct <= 15) ? DL_ERR : (pct <= 35) ? DL_WARN : DL_OK;
+
+    tft.drawRoundRect(BX, BY, BW, BH, 2, DL_TEXT3);
+    tft.fillRect(BX + BW, BY + 3, 2, BH - 6, DL_TEXT3);  // terminal nub
+
+    int fill_w = ((BW - 4) * pct) / 100;
+    tft.fillRect(BX + 2, BY + 2, BW - 4, BH - 4, DL_BG);  // clear interior
+    if (fill_w > 0) tft.fillRect(BX + 2, BY + 2, fill_w, BH - 4, col);
+}
+
 void uiIdle() {
     tft.fillScreen(DL_BG);
+    drawBatteryIcon();
 
-    const int TW=84, TH=84, R=16;
-    const int T1X=27,  T1Y=20;   // Record   top-left
-    const int T2X=129, T2Y=20;   // Camera   top-right
-    const int T3X=27,  T3Y=130;  // Ideas    bottom-left
-    const int T4X=129, T4Y=130;  // Dict     bottom-right
+    // Tiles fill the circle edge-to-edge across a slim center gutter — outer
+    // corners sit at radius ~108 (matches the safe radius used elsewhere,
+    // e.g. the record-ring arc), so nothing bleeds past the round glass.
+    const int TW=73, TH=73, R=14;
+    const int T1X=44,  T1Y=44;    // top-left
+    const int T2X=123, T2Y=44;    // top-right
+    const int T3X=44,  T3Y=123;   // bottom-left
+    const int T4X=123, T4Y=123;   // bottom-right
 
-    // Per-app dark-tinted backgrounds — near-black with a colour hint
-    const uint16_t BG_REC = 0x0006;   // deep blue
-    const uint16_t BG_CAM = 0x00C2;   // deep teal
-    const uint16_t BG_NOT = 0x1840;   // deep amber
-    const uint16_t BG_DIC = 0x1803;   // deep violet
+    // Tile fill is a fixed white, matching the icon art's own baked-in
+    // background exactly (see icon_art.h) — no seam, and the white tile reads
+    // as a high-contrast badge against the app's black canvas. Per-app dark
+    // tints were tried first and looked wrong (icons are AI-generated
+    // characters designed for a white background — see design_language
+    // memory); white tiles is the verified-working direction.
+    const uint16_t TILE_BG = 0xFFFF;
 
-    // ── RECORD ──────────────────────────────────────────────────
-    tft.fillRoundRect(T1X, T1Y, TW, TH, R, BG_REC);
-    tft.drawRoundRect(T1X,   T1Y,   TW,   TH,   R,   DL_REC);
-    tft.drawRoundRect(T1X+1, T1Y+1, TW-2, TH-2, R-1, DL_REC);
-    { int mx=T1X+42, my=T1Y+13;
-      tft.fillRoundRect(mx-11, my, 22, 30, 11, DL_REC);
-      tft.drawArc(mx, my+30, 16, 10, 180, 360, DL_REC, BG_REC);
-      tft.fillRect(mx-1, my+45, 3, 7, DL_REC);
-      tft.fillRoundRect(mx-9, my+51, 18, 4, 2, DL_REC); }
-    tft.setTextColor(DL_REC, BG_REC);
-    tft.drawCentreString("Record", T1X+42, T1Y+66, 2);
+    // Icon art is centered in the upper 2/3 of each tile, label text below.
+    const int IX = (TW - ICON_ART_SIZE) / 2, IY = 4;
 
-    // ── CAMERA ──────────────────────────────────────────────────
-    tft.fillRoundRect(T2X, T2Y, TW, TH, R, BG_CAM);
-    tft.drawRoundRect(T2X,   T2Y,   TW,   TH,   R,   DL_CAM);
-    tft.drawRoundRect(T2X+1, T2Y+1, TW-2, TH-2, R-1, DL_CAM);
-    { int cx=T2X+42, cy=T2Y+34;
-      tft.fillRoundRect(cx-24, cy-12, 48, 26, 4, DL_CAM);
-      tft.fillRoundRect(cx+12, cy-18,  9,  8, 2, DL_CAM);
-      tft.fillCircle(cx, cy, 9, BG_CAM);
-      tft.drawCircle(cx, cy, 9, DL_CAM);
-      tft.fillCircle(cx, cy, 5, DL_CAM);
-      tft.fillCircle(cx-2, cy-2, 2, BG_CAM); }
-    tft.setTextColor(DL_CAM, BG_CAM);
-    tft.drawCentreString("Camera", T2X+42, T2Y+66, 2);
+    if (s_home_page == 0) {
+        // ── RECORD ──────────────────────────────────────────────────
+        tft.fillRoundRect(T1X, T1Y, TW, TH, R, TILE_BG);
+        tft.pushImage(T1X + IX, T1Y + IY, ICON_ART_SIZE, ICON_ART_SIZE, icon_record);
+        tft.setTextColor(DL_INK_FIXED, TILE_BG);
+        tft.drawCentreString("Record", T1X+36, T1Y+54, 2);
 
-    // ── IDEAS ────────────────────────────────────────────────────
-    tft.fillRoundRect(T3X, T3Y, TW, TH, R, BG_NOT);
-    tft.drawRoundRect(T3X,   T3Y,   TW,   TH,   R,   DL_NOT);
-    tft.drawRoundRect(T3X+1, T3Y+1, TW-2, TH-2, R-1, DL_NOT);
-    { int nx=T3X+42, ny=T3Y+14;
-      tft.fillRoundRect(nx-14, ny, 28, 36, 3, DL_NOT);
-      for (int i=0; i<4; i++)
-          tft.fillRect(nx-9, ny+7+i*7, 18, 2, BG_NOT); }
-    tft.setTextColor(DL_NOT, BG_NOT);
-    char nlabel[16];
-    if (s_note_count > 0) snprintf(nlabel, sizeof(nlabel), "Ideas (%d)", s_note_count);
-    else strcpy(nlabel, "Ideas");
-    tft.drawCentreString(nlabel, T3X+42, T3Y+66, 2);
+        // ── CAMERA ──────────────────────────────────────────────────
+        tft.fillRoundRect(T2X, T2Y, TW, TH, R, TILE_BG);
+        tft.pushImage(T2X + IX, T2Y + IY, ICON_ART_SIZE, ICON_ART_SIZE, icon_camera);
+        tft.setTextColor(DL_INK_FIXED, TILE_BG);
+        tft.drawCentreString("Camera", T2X+36, T2Y+54, 2);
 
-    // ── DICT ────────────────────────────────────────────────────
-    tft.fillRoundRect(T4X, T4Y, TW, TH, R, BG_DIC);
-    tft.drawRoundRect(T4X,   T4Y,   TW,   TH,   R,   DL_DIC);
-    tft.drawRoundRect(T4X+1, T4Y+1, TW-2, TH-2, R-1, DL_DIC);
-    { int bx=T4X+42, by=T4Y+16;
-      tft.fillRoundRect(bx-18, by, 16, 26, 2, DL_DIC);
-      tft.fillRoundRect(bx+2,  by, 16, 26, 2, DL_DIC);
-      tft.fillRect(bx-2, by, 4, 26, BG_DIC);
-      for (int i=0; i<3; i++) {
-          tft.fillRect(bx-16, by+5+i*7, 10, 2, BG_DIC);
-          tft.fillRect(bx+6,  by+5+i*7, 10, 2, BG_DIC); } }
-    tft.setTextColor(DL_DIC, BG_DIC);
-    char dlabel[16];
-    if (s_word_count > 0) snprintf(dlabel, sizeof(dlabel), "Dict (%d)", s_word_count);
-    else strcpy(dlabel, "Dict");
-    tft.drawCentreString(dlabel, T4X+42, T4Y+66, 2);
+        // ── IDEAS ────────────────────────────────────────────────────
+        tft.fillRoundRect(T3X, T3Y, TW, TH, R, TILE_BG);
+        tft.pushImage(T3X + IX, T3Y + IY, ICON_ART_SIZE, ICON_ART_SIZE, icon_ideas);
+        tft.setTextColor(DL_INK_FIXED, TILE_BG);
+        char nlabel[16];
+        if (s_note_count > 0) snprintf(nlabel, sizeof(nlabel), "Ideas (%d)", s_note_count);
+        else strcpy(nlabel, "Ideas");
+        tft.drawCentreString(nlabel, T3X+36, T3Y+54, 2);
 
-    // ── WiFi indicator — center gap ───────────────────────────────
-    bool wcon = (WiFi.status() == WL_CONNECTED);
-    uint16_t wc = wcon ? DL_WIFI_ON : DL_TEXT3;
-    tft.fillCircle(120, 117, 5, wc);
-    if (wcon) {
-        tft.drawCircle(120, 117, 8,  wc);
-        tft.drawCircle(120, 117, 11, DL_SURFACE);
+        // ── DICT ────────────────────────────────────────────────────
+        tft.fillRoundRect(T4X, T4Y, TW, TH, R, TILE_BG);
+        tft.pushImage(T4X + IX, T4Y + IY, ICON_ART_SIZE, ICON_ART_SIZE, icon_dict);
+        tft.setTextColor(DL_INK_FIXED, TILE_BG);
+        char dlabel[16];
+        if (s_word_count > 0) snprintf(dlabel, sizeof(dlabel), "Dict (%d)", s_word_count);
+        else strcpy(dlabel, "Dict");
+        tft.drawCentreString(dlabel, T4X+36, T4Y+54, 2);
+    } else {
+        // ── ASK ─────────────────────────────────────────────────────
+        bool wcon = (WiFi.status() == WL_CONNECTED);
+        tft.fillRoundRect(T1X, T1Y, TW, TH, R, TILE_BG);
+        tft.pushImage(T1X + IX, T1Y + IY, ICON_ART_SIZE, ICON_ART_SIZE, icon_ask);
+        tft.setTextColor(DL_INK_FIXED, TILE_BG);
+        tft.drawCentreString("Ask AI", T1X+36, T1Y+54, 2);
+        if (!wcon) {
+            tft.setTextFont(1); tft.setTextColor(DL_TEXT3, TILE_BG);
+            tft.drawCentreString("wifi needed", T1X+36, T1Y+68, 1);
+        }
+
+        // ── WIFI ────────────────────────────────────────────────────
+        tft.fillRoundRect(T2X, T2Y, TW, TH, R, TILE_BG);
+        tft.pushImage(T2X + IX, T2Y + IY, ICON_ART_SIZE, ICON_ART_SIZE, icon_wifi);
+        tft.setTextColor(DL_INK_FIXED, TILE_BG);
+        tft.drawCentreString(wcon ? "WiFi On" : "WiFi Off", T2X+36, T2Y+54, 2);
+
+        // ── (reserved for future apps) ────────────────────────────────
+        tft.drawRoundRect(T3X, T3Y, TW, TH, R, DL_LINE);
+        tft.drawRoundRect(T4X, T4Y, TW, TH, R, DL_LINE);
+    }
+
+    // Page dots — circle-safe band at y≈207
+    for (int p = 0; p < 2; p++) {
+        int dx = 120 + (p == 0 ? -8 : 8);
+        if (p == s_home_page) tft.fillCircle(dx, 207, 3, DL_TEXT1);
+        else                  tft.drawCircle(dx, 207, 3, DL_LINE);
     }
 }
 
+// ── Idle screensaver: a friendly ticking clock face ───────────────────────────
+// Shown after CLOCK_IDLE_MS of no touch, driven by the battery-backed PCF8563
+// RTC (not live WiFi/NTP — see rtc.cpp). Any touch returns to the icon grid.
+// Face art is AI-generated + cropped/converted offline — see clock_art.h/.cpp.
+// Hands stay hand-drawn vectors since they rotate live; baking them into the
+// bitmap isn't possible.
+//
+// The face bitmap's background is a FIXED white (the character art only
+// reads correctly on white — a dark-recolored version looked distorted/wrong,
+// verified on-device), independent of the app's dark theme. So hand/hub color
+// here must NOT use DL_TEXT1 (that's white in the dark theme = invisible on
+// this white face) — use DL_INK_FIXED, same always-black ink the home-tile
+// labels use for the same reason.
+
+static void uiClockHands(int h, int m) {
+    // 0° = 12 o'clock, clockwise
+    float m_theta = (m / 60.0f) * 2.0f * 3.14159265f;
+    float h_theta = ((h % 12) + m / 60.0f) / 12.0f * 2.0f * 3.14159265f;
+    int mx = 120 + (int)(48 * sinf(m_theta)), my = 120 - (int)(48 * cosf(m_theta));
+    int hx = 120 + (int)(30 * sinf(h_theta)), hy = 120 - (int)(30 * cosf(h_theta));
+    tft.drawLine(120, 120, mx, my, DL_INK_FIXED);
+    tft.drawLine(121, 120, mx + 1, my, DL_INK_FIXED);
+    tft.drawLine(120, 120, hx, hy, DL_INK_FIXED);
+    tft.drawLine(121, 120, hx + 1, hy, DL_INK_FIXED);
+    tft.fillCircle(120, 120, 4, DL_INK_FIXED);
+}
+
+// closed=false/true selects which baked face bitmap to show (open vs. blinking).
+// Hands are redrawn on top every time, since they aren't part of the bitmap.
+static void uiClockBlink(bool closed, int h, int m) {
+    tft.pushImage(0, 0, CLOCK_ART_W, CLOCK_ART_H, closed ? clock_face_closed : clock_face_open);
+    uiClockHands(h, m);
+}
+
+static void uiClockFace(int h, int m) {
+    uiClockBlink(false, h, m);
+}
+
 static void uiBootSplash() {
-    tft.fillScreen(TFT_BLACK);
+    tft.fillScreen(DL_BG);
 
     // ── Phase 1: ring expands from center ─────────────────────
     for (int r = 1; r <= 108; r++) {
         tft.drawCircle(120, 120, r,     0xFFFF);  // bright front
         if (r > 3)  tft.drawCircle(120, 120, r-3, 0x4208);  // dim trail
-        if (r > 7)  tft.drawCircle(120, 120, r-7, TFT_BLACK); // erase tail
+        if (r > 7)  tft.drawCircle(120, 120, r-7, DL_BG);   // erase tail
         delay(4);
     }
-    for (int r = 102; r <= 116; r++) tft.drawCircle(120, 120, r, TFT_BLACK);
+    for (int r = 102; r <= 116; r++) tft.drawCircle(120, 120, r, DL_BG);
 
     delay(100);
 
@@ -267,7 +368,7 @@ static void uiBootSplash() {
 
     // "designed with love"
     for (int i = 0; i < 6; i++) {
-        tft.setTextColor(wh[i], TFT_BLACK);
+        tft.setTextColor(wh[i], DL_BG);
         tft.drawCentreString("designed with love", 120, 98, 2);
         delay(45);
     }
@@ -275,7 +376,7 @@ static void uiBootSplash() {
 
     // "Subash" in gold
     for (int i = 0; i < 6; i++) {
-        tft.setTextColor(gd[i], TFT_BLACK);
+        tft.setTextColor(gd[i], DL_BG);
         tft.drawCentreString("Subash", 120, 122, 4);
         delay(55);
     }
@@ -283,16 +384,16 @@ static void uiBootSplash() {
     // ── Phase 3: hold ─────────────────────────────────────────
     delay(1600);
 
-    // ── Phase 4: black circle wipes from center ───────────────
+    // ── Phase 4: circle wipes from center back to blank canvas ─
     for (int r = 0; r <= 125; r += 3) {
-        tft.fillCircle(120, 120, r, TFT_BLACK);
+        tft.fillCircle(120, 120, r, DL_BG);
         delay(5);
     }
 }
 
 static void enterDeepSleep() {
-    tft.fillScreen(TFT_BLACK);
-    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    tft.fillScreen(DL_BG);
+    tft.setTextColor(DL_TEXT3, DL_BG);
     tft.drawCentreString("Sleeping...", 120, 112, 2);
     delay(600);
     digitalWrite(43, LOW);  // backlight off
@@ -428,7 +529,7 @@ void uiNotesList() {
 static int drawWrappedTextEx(const char* text, int x, int y_start, int w, uint16_t colour) {
     const int max_y = 197;  // stop before footer zone
     tft.setTextFont(2);
-    tft.setTextColor(colour, TFT_BLACK);
+    tft.setTextColor(colour, DL_BG);
     tft.setTextWrap(false);
     const int LINE_H = 18, CHAR_W = 8;
     int max_chars = w / CHAR_W;
@@ -450,7 +551,7 @@ static int drawWrappedTextEx(const char* text, int x, int y_start, int w, uint16
     }
     if (*p && cy > y_start) {
         tft.setCursor(x + w - 20, cy - LINE_H);
-        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.setTextColor(DL_TEXT3, DL_BG);
         tft.print("...");
     }
     return cy;
@@ -822,21 +923,33 @@ void uiDictResult(const char* definition, bool found, int rank = -1, int total =
         tft.drawCentreString("tap = try again", 120, 155, 2);
         return;
     }
-    // Parse: "WORD\n(pos)\ndef text\neg. example" (4 lines, last 2 optional)
-    char word[48]={0}, pos[32]={0}, def[200]={0}, eg[120]={0};
-    const char* nl1 = strchr(definition, '\n');
-    const char* nl2 = nl1 ? strchr(nl1+1, '\n') : nullptr;
-    const char* nl3 = nl2 ? strchr(nl2+1, '\n') : nullptr;
-    if (nl1) {
-        strncpy(word, definition, min((int)(nl1-definition), 47));
-        if (nl2) {
-            strncpy(pos, nl1+1, min((int)(nl2-nl1-1), 31));
-            if (nl3) {
-                strncpy(def, nl2+1, min((int)(nl3-nl2-1), 199));
-                strncpy(eg,  nl3+1, 119);
-            } else {
-                strncpy(def, nl2+1, 199);
-            }
+    // Parse: "WORD\n(pos)\ndef text\nTA: tamil\neg. example" (lines 1-2 fixed, 3-4 optional)
+    char word[48]={0}, pos[32]={0}, def[200]={0}, tamil[100]={0}, eg[120]={0};
+    const char* lines[5] = {0};
+    int nlines = 0;
+    const char* p = definition;
+    lines[nlines++] = p;
+    while (nlines < 5) {
+        const char* nl = strchr(p, '\n');
+        if (!nl) break;
+        lines[nlines++] = nl + 1;
+        p = nl + 1;
+    }
+    auto line_len = [&](int i) -> int {
+        const char* start = lines[i];
+        const char* end = (i + 1 < nlines) ? lines[i+1] - 1 : start + strlen(start);
+        return (int)(end - start);
+    };
+    if (nlines >= 1) strncpy(word, lines[0], min(line_len(0), 47));
+    if (nlines >= 2) strncpy(pos,  lines[1], min(line_len(1), 31));
+    if (nlines >= 3) strncpy(def,  lines[2], min(line_len(2), 199));
+    for (int i = 3; i < nlines; i++) {
+        int len = line_len(i);
+        if (len > 3 && strncmp(lines[i], "TA:", 3) == 0) {
+            int s = 3; while (lines[i][s] == ' ') s++;
+            strncpy(tamil, lines[i] + s, min(len - s, 99));
+        } else if (len > 0) {
+            strncpy(eg, lines[i], min(len, 119));
         }
     }
 
@@ -849,11 +962,18 @@ void uiDictResult(const char* definition, bool found, int rank = -1, int total =
     tft.drawCentreString(pos, 120, 42, 2);
     tft.drawFastHLine(28, 56, 184, DL_DIC);
 
-    int def_bottom = drawWrappedTextEx(def, 28, 60, 184, DL_TEXT1);
+    int y_bottom = drawWrappedTextEx(def, 28, 60, 184, DL_TEXT1);
+
+    if (strlen(tamil) > 0) {
+        tft.drawFastHLine(28, y_bottom + 2, 184, DL_LINE);
+        char ta_line[110];
+        snprintf(ta_line, sizeof(ta_line), "TA: %s", tamil);
+        y_bottom = drawWrappedTextEx(ta_line, 28, y_bottom + 6, 184, DL_DIC);
+    }
 
     if (strlen(eg) > 0) {
-        tft.drawFastHLine(28, def_bottom + 2, 184, DL_LINE);
-        drawWrappedTextEx(eg, 28, def_bottom + 6, 184, DL_TEXT3);
+        tft.drawFastHLine(28, y_bottom + 2, 184, DL_LINE);
+        drawWrappedTextEx(eg, 28, y_bottom + 6, 184, DL_TEXT3);
     }
 
     tft.drawFastHLine(38, 203, 164, DL_LINE);
@@ -923,6 +1043,90 @@ void uiWordDetail(int rank, const char* definition, int scroll = 0) {
     uiDetailFooter();
 }
 
+// ── Display: AI Ask screens ───────────────────────────────────────────────────
+
+void uiAskHome() {
+    tft.fillScreen(DL_BG);
+
+    tft.setTextColor(DL_ASK, DL_BG);
+    tft.drawCentreString("ASK AI", 120, 8, 4);
+    tft.drawFastHLine(35, 44, 170, DL_ASK);
+
+    // Top card — Photo + Voice
+    const uint16_t BG_ASKC = 0x0820;
+    tft.fillRoundRect(28, 50, 184, 72, 12, BG_ASKC);
+    tft.drawRoundRect(28,   50,   184,   72,   12, DL_ASK);
+    tft.drawRoundRect(29,   51,   182,   70,   11, DL_ASK);
+    { int cx=120, cy=76;
+      tft.fillRoundRect(cx-18, cy-10, 36, 20, 4, DL_ASK);
+      tft.fillRoundRect(cx+10, cy-16,  7,  7, 2, DL_ASK);
+      tft.fillCircle(cx, cy, 7, BG_ASKC);
+      tft.drawCircle(cx, cy, 7, DL_ASK);
+      tft.fillCircle(cx, cy, 3, DL_ASK); }
+    tft.setTextColor(DL_ASK, BG_ASKC);
+    tft.drawCentreString("Photo + Voice", 120, 103, 2);
+
+    // Bottom card — Voice only
+    tft.fillRoundRect(28, 130, 184, 72, 12, DL_SURFACE);
+    tft.drawRoundRect(28,   130,   184,   72,   12, DL_TEXT3);
+    tft.drawRoundRect(29,   131,   182,   70,   11, DL_TEXT3);
+    { int mx=120, my=154;
+      tft.fillRoundRect(mx-8, my-13, 16, 22, 8, DL_TEXT2);
+      tft.drawArc(mx, my+9, 12, 8, 180, 360, DL_TEXT2, DL_SURFACE);
+      tft.drawFastVLine(mx, my+21, 5, DL_TEXT2);
+      tft.drawFastHLine(mx-5, my+26, 10, DL_TEXT2); }
+    tft.setTextColor(DL_TEXT1, DL_SURFACE);
+    tft.drawCentreString("Voice Only", 120, 183, 2);
+
+    tft.setTextFont(1);
+    tft.setTextColor(DL_TEXT3, DL_BG);
+    tft.drawCentreString("swipe right = back", 120, 219, 1);
+}
+
+void uiAskVoice(uint32_t elapsed_ms, bool has_photo) {
+    tft.fillScreen(DL_BG);
+
+    int prog = min((int)((long)elapsed_ms * 360 / 10000), 360);
+    tft.drawArc(120, 120, 108, 100, 0, 360, DL_SURFACE2, DL_BG);
+    if (prog > 0) tft.drawArc(120, 120, 108, 100, 0, prog, DL_ASK, DL_BG);
+
+    bool pulse = (elapsed_ms / 800) % 2 == 0;
+    tft.fillCircle(120, 82, 5, pulse ? DL_ASK : DL_SURFACE2);
+
+    tft.setTextColor(DL_ASK, DL_BG);
+    tft.drawCentreString(has_photo ? "ASK+CAM" : "ASK", 120, 92, 4);
+
+    uint32_t s = elapsed_ms / 1000;
+    char t[10]; snprintf(t, sizeof(t), "%02lu:%02lu", s/60, s%60);
+    tft.setTextColor(DL_TEXT1, DL_BG);
+    tft.drawCentreString(t, 120, 130, 4);
+
+    int remaining = max(0, 10 - (int)(elapsed_ms/1000));
+    char rem[10]; snprintf(rem, sizeof(rem), "-%ds", remaining);
+    tft.setTextColor(DL_TEXT3, DL_BG);
+    tft.drawCentreString(rem, 120, 163, 2);
+
+    tft.setTextColor(DL_TEXT2, DL_BG);
+    tft.drawCentreString("tap to send", 120, 196, 2);
+}
+
+void uiAskResult(const char* answer, bool saved) {
+    tft.fillScreen(DL_BG);
+    tft.setTextColor(DL_ASK, DL_BG);
+    tft.drawCentreString("AI ANSWER", 120, 9, 2);
+    if (saved) {
+        tft.setTextFont(1);
+        tft.setTextColor(DL_OK, DL_BG);
+        tft.drawString("saved", 172, 10);
+    }
+    tft.drawFastHLine(28, 26, 184, DL_ASK);
+    drawWrappedText(answer, 30, 33, 180, 200, s_ask_scroll);
+    tft.drawFastHLine(35, 203, 170, DL_LINE);
+    tft.setTextFont(1);
+    tft.setTextColor(DL_TEXT3, DL_BG);
+    tft.drawCentreString("tap/swipe right = back  |  up/dn = scroll", 120, 210, 1);
+}
+
 // Shared footer — circle-safe at y=210 (x≈40-200). Tap x<120=BACK, x>120=DELETE
 static void uiDetailFooter() {
     tft.drawFastHLine(40, 203, 160, DL_LINE);
@@ -935,8 +1139,8 @@ static void uiDetailFooter() {
 
 void uiDeleteConfirm(const char* label) {
     // Overlay asking for second tap to confirm
-    tft.fillRoundRect(30, 85, 180, 70, 12, TFT_RED);
-    tft.setTextColor(TFT_WHITE, TFT_RED);
+    tft.fillRoundRect(30, 85, 180, 70, 12, DL_ERR);
+    tft.setTextColor(TFT_WHITE, DL_ERR);
     tft.drawCentreString("DELETE?", 120, 98, 4);
     tft.setTextFont(1);
     tft.drawCentreString(label, 120, 130, 1);
@@ -1030,10 +1234,15 @@ static void retryPendingNotes() {
         size_t pcm_size    = is_wav ? fsize - 44 : fsize;
         float secs = (float)pcm_size / get_bytes_per_sec();
         Serial.printf("[PEND] Retrying %s (%.1fs)...\n", path, secs);
+        // Check if audio is all-zero (silence — mic issue or accidental tap)
+        size_t nz = 0;
+        for (size_t j = 0; j < min(pcm_size, (size_t)200); j++) if (pcm[j]) nz++;
+        Serial.printf("[PEND] Non-zero bytes in first 200: %u\n", (unsigned)nz);
         uiStatus("Recovering idea...", path + 1, DL_WARN);
 
         char transcript[640] = {0};
-        bool ok = deepgram_transcribe(pcm, pcm_size, transcript, sizeof(transcript) - 1);
+        bool perm = false;
+        bool ok = deepgram_transcribe(pcm, pcm_size, transcript, sizeof(transcript) - 1, &perm);
         free(buf);
 
         if (ok && strlen(transcript) > 0) {
@@ -1048,8 +1257,14 @@ static void retryPendingNotes() {
             strncpy(s_previews[0], transcript, PREVIEW_CHARS);
             s_previews[0][PREVIEW_CHARS] = '\0';
             Serial.printf("[PEND] Recovered → note_%03d\n", s_note_counter);
+        } else if (perm && pcm_size < get_bytes_per_sec()) {
+            // < 1 second + no speech = accidental tap, junk
+            SD.remove(path);
+            s_pending_count--;
+            Serial.printf("[PEND] Too short + no speech — deleted %s\n", path);
         } else {
-            Serial.printf("[PEND] Still failed — keeping %s for next time.\n", path);
+            // Network error OR substantial audio DeepGram couldn't parse — keep
+            Serial.printf("[PEND] Keeping %s (perm=%d size=%u)\n", path, perm, (unsigned)pcm_size);
         }
     }
 }
@@ -1254,6 +1469,127 @@ static bool delete_word(int rank) {
     return true;
 }
 
+// Build a short summary of the last N notes for AI context.
+// Caller must hold sd_reinit before and sd_release after.
+static void buildNotesContext(char* buf, size_t max) {
+    buf[0] = '\0';
+    if (s_note_count == 0) return;
+    size_t pos = 0;
+    pos += snprintf(buf + pos, max - pos, "My recent ideas:\n");
+    int count = min(s_note_count, 10);
+    for (int rank = 0; rank < count && pos + 80 < max; rank++) {
+        int num = s_note_count - rank;
+        char path[24]; snprintf(path, sizeof(path), "/note_%03d.txt", num);
+        File f = SD.open(path, FILE_READ);
+        if (!f) continue;
+        char preview[72] = {0};
+        int n = f.readBytes(preview, 68);
+        preview[n] = '\0';
+        for (int j = 0; j < n; j++) if (preview[j] == '\n') preview[j] = ' ';
+        f.close();
+        pos += snprintf(buf + pos, max - pos, "- %s\n", preview);
+    }
+}
+
+// Reads a just-saved photo back off SD and syncs it to Telegram. Reads
+// rather than threading the JPEG buffer out of cam_capture_save() — keeps
+// that function's existing contract (and camera.cpp) untouched; same
+// SD.open+ps_malloc+readBytes recipe cam_view_photo() already uses.
+static void syncPhotoToTelegram(int num) {
+    if (WiFi.status() != WL_CONNECTED) return;
+    char path[28];
+    snprintf(path, sizeof(path), "/photo_%03d.jpg", num);
+    sd_reinit(tft.getSPIinstance());
+    File f = SD.open(path, FILE_READ);
+    if (!f) { sd_release(); Serial.printf("[TG] Cannot reopen %s for sync\n", path); return; }
+    size_t fsize = f.size();
+    uint8_t* buf = (uint8_t*)ps_malloc(fsize);
+    if (buf) {
+        f.readBytes((char*)buf, fsize);
+    }
+    f.close();
+    sd_release();
+    if (!buf) { Serial.println("[TG] photo sync: ps_malloc OOM"); return; }
+
+    char caption[24];
+    snprintf(caption, sizeof(caption), "Photo %d", num);
+    telegram_send_photo(buf, fsize, caption);
+    free(buf);
+}
+
+// One-time backfill: pushes every note/photo already on the SD card to
+// Telegram the first time WiFi connects after this feature was added. Marked
+// done via /tg_synced.flag so it never re-runs (and never re-sends) after
+// that — only ever fires once, on whichever boot has both WiFi and a
+// not-yet-set flag. Assumes contiguous /note_NNN.txt and /photo_NNN.jpg
+// numbering from 1..count, same assumption cam_scan_photos() already makes.
+static void backfillTelegramSync() {
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    sd_reinit(tft.getSPIinstance());
+    bool already_synced = SD.exists("/tg_synced.flag");
+    sd_release();
+    if (already_synced) return;
+
+    Serial.printf("[TG] First-time backfill: %d notes, %d photos...\n",
+                  s_note_count, s_photo_count);
+    uiStatus("Syncing to Telegram...", "one-time, please wait", DL_OK);
+
+    for (int i = 1; i <= s_note_count; i++) {
+        char path[24];
+        snprintf(path, sizeof(path), "/note_%03d.txt", i);
+        char buf[640];
+        bool ok = false;
+
+        sd_reinit(tft.getSPIinstance());
+        File f = SD.open(path, FILE_READ);
+        if (f) {
+            size_t n = f.readBytes(buf, sizeof(buf) - 1);
+            buf[n] = '\0';
+            f.close();
+            ok = true;
+        }
+        sd_release();
+
+        if (ok) {
+            telegram_send_text(buf);
+            Serial.printf("[TG] Backfilled note %d/%d\n", i, s_note_count);
+        }
+    }
+
+    for (int i = 1; i <= s_photo_count; i++) {
+        char path[28];
+        snprintf(path, sizeof(path), "/photo_%03d.jpg", i);
+        uint8_t* buf = nullptr;
+        size_t fsize = 0;
+
+        sd_reinit(tft.getSPIinstance());
+        File f = SD.open(path, FILE_READ);
+        if (f) {
+            fsize = f.size();
+            buf = (uint8_t*)ps_malloc(fsize);
+            if (buf) f.readBytes((char*)buf, fsize);
+            f.close();
+        }
+        sd_release();
+
+        if (buf) {
+            char caption[24];
+            snprintf(caption, sizeof(caption), "Photo %d", i);
+            telegram_send_photo(buf, fsize, caption);
+            free(buf);
+            Serial.printf("[TG] Backfilled photo %d/%d\n", i, s_photo_count);
+        }
+    }
+
+    sd_reinit(tft.getSPIinstance());
+    File flag = SD.open("/tg_synced.flag", FILE_WRITE);
+    if (flag) { flag.print("1"); flag.close(); }
+    sd_release();
+
+    Serial.println("[TG] Backfill complete.");
+}
+
 static bool saveNote(int num, const char* text) {
     char path[24];
     snprintf(path, sizeof(path), "/note_%03d.txt", num);
@@ -1262,6 +1598,9 @@ static bool saveNote(int num, const char* text) {
     f.print(text);
     f.close();
     Serial.printf("[NOTE] Saved %s (%d chars)\n", path, strlen(text));
+    // Best-effort mobile sync — single hook covers every save path (fresh
+    // transcription, Ask AI Q&A, and retried pending audio all call this).
+    telegram_send_text(text);
     return true;
 }
 
@@ -1279,6 +1618,7 @@ static bool loadNoteText(int rank, char* buf, size_t max) {
 
 // ── WiFi ──────────────────────────────────────────────────────────────────────
 static bool s_wifi_ok = false;
+#define TZ_OFFSET_SEC 19800   // IST, UTC+5:30 — change if you're outside India
 
 static void wifiConnect() {
     WiFi.mode(WIFI_STA);
@@ -1286,7 +1626,7 @@ static void wifiConnect() {
     delay(100);
 
     // Scan once to find which saved network is in range
-    tft.fillScreen(TFT_BLACK);
+    tft.fillScreen(DL_BG);
     tft.setTextColor(DL_TEXT1, DL_BG);
     tft.drawCentreString("Connecting WiFi", 120, 105, 2);
     tft.setTextColor(DL_TEXT3, DL_BG);
@@ -1335,6 +1675,25 @@ static void wifiConnect() {
         Serial.printf("[WiFi] %s\n", WiFi.localIP().toString().c_str());
         tft.setTextColor(DL_OK, DL_BG);
         tft.drawCentreString("WiFi OK", 120, 147, 2);
+
+        // Seed/correct the battery-backed RTC from NTP — assumes IST
+        // (UTC+5:30, no DST). Change TZ_OFFSET_SEC if you're elsewhere.
+        if (s_rtc_ok) {
+            Serial.println("[RTC] requesting NTP time...");
+            configTime(TZ_OFFSET_SEC, 0, "pool.ntp.org", "time.google.com");
+            struct tm ti;
+            if (getLocalTime(&ti, 5000)) {
+                Serial.printf("[RTC] NTP got %04d-%02d-%02d %02d:%02d:%02d\n",
+                              ti.tm_year + 1900, ti.tm_mon + 1, ti.tm_mday,
+                              ti.tm_hour, ti.tm_min, ti.tm_sec);
+                rtc_set_time(ti.tm_hour, ti.tm_min, ti.tm_sec,
+                             ti.tm_wday, ti.tm_mday, ti.tm_mon + 1, ti.tm_year + 1900);
+            } else {
+                Serial.println("[RTC] NTP sync failed — keeping existing RTC time");
+            }
+        } else {
+            Serial.println("[RTC] skipping NTP sync — no RTC chip found at boot");
+        }
     } else {
         s_wifi_ok = false;
         Serial.println("[WiFi] FAILED — offline");
@@ -1356,15 +1715,16 @@ void setup() {
     Serial.println("========================================");
 
     Wire.begin(5, 6);
+    s_rtc_ok = rtc_init();
     tft.begin();
-    tft.setRotation(0);
+    tft.setRotation(1);  // 90° CW — matches case mounting orientation
     pinMode(43, OUTPUT);
     digitalWrite(43, HIGH);
     Serial.printf("[MAIN] Display OK.\n");
 
     if (!from_sleep) {
         uiBootSplash();
-        tft.fillScreen(TFT_BLACK);
+        tft.fillScreen(DL_BG);
         tft.setTextColor(DL_TEXT1, DL_BG);
         tft.drawCentreString("Checking SD...", 120, 108, 2);
     }
@@ -1395,12 +1755,14 @@ void setup() {
             retryPendingNotes();
             sd_release();
         }
+        if (s_wifi_ok) backfillTelegramSync();
     } else {
         // Wake from sleep: reconnect WiFi in background, don't block UI
         WiFi.begin();
     }
 
     mic_init();
+    battery_init();
     Serial.printf("[MAIN] READY.\n");
     uiIdle();
     s_state = IDLE;
@@ -1419,77 +1781,163 @@ void loop() {
     switch (s_state) {
 
         // ── IDLE ─────────────────────────────────────────────────────────────
+        // Page 0: Record/Camera/Ideas/Dict. Page 1: Ask/WiFi (+2 reserved).
+        // Swipe left/right turns the page; tap opens a tile on the current page.
         case IDLE:
-            // sleep disabled — INT drain unreliable, causes instant-wake loop
-            // if (now - s_last_activity > IDLE_SLEEP_MS) enterDeepSleep();
+            // Idle screensaver — only kicks in once the RTC has a trustworthy time.
+            // Signed cast matters: checkTouch() can bump s_last_activity to a
+            // millis() value slightly AFTER `now` (captured at the top of this
+            // loop() tick, before checkTouch() runs) — plain unsigned
+            // subtraction then wraps to ~4.29 billion and fires immediately.
+            // Confirmed on-device: "[HOME] idle 4294967295ms -> screensaver".
+            static bool s_screensaver_blocked_logged = false;
+            if ((int32_t)(now - s_last_activity) > (int32_t)CLOCK_IDLE_MS && s_rtc_ok) {
+                bool valid = rtc_time_valid();
+                if (valid) {
+                    Serial.printf("[HOME] idle %lums -> screensaver (was page %d)\n",
+                                  (unsigned long)(now - s_last_activity), s_home_page);
+                    s_state = IDLE_CLOCK;
+                    s_timer = now;
+                    s_ui_refresh = 0;  // force an immediate face draw
+                    s_screensaver_blocked_logged = false;
+                    break;
+                } else if (!s_screensaver_blocked_logged) {
+                    Serial.println("[HOME] idle timeout but RTC time not valid — staying on grid");
+                    s_screensaver_blocked_logged = true;
+                }
+            }
             if (tevt == T_TAP && now - s_timer > 400) {
                 s_timer = now;
                 int tap_x = (int)s_swipe_last_x;
                 int tap_y = (int)s_swipe_start_y;
-                if (tap_y < 120) {
-                    if (tap_x < 120) {
-                        // ── RECORD icon (top-left) ────────────────────────
-                        if (start_i2s_recording()) {
-                            s_state = RECORDING;
-                            s_rec_start = s_ui_refresh = now;
-                            uiRecording(0);
-                        } else {
-                            uiStatus("Mic failed", "check PSRAM=OPI in IDE", TFT_RED);
-                            delay(2500); uiIdle();
-                        }
-                    } else {
-                        // ── CAMERA icon (top-right) ───────────────────────
-                        uiStatus("Starting camera...", nullptr, DL_CAM);
-                        bool cam_ok = cam_init();
-                        s_state = CAMERA_VIEW;
-                        uiCamera(cam_ok);
+                int slot = (tap_y < 120 ? 0 : 2) + (tap_x < 120 ? 0 : 1); // 0=TL 1=TR 2=BL 3=BR
+                Serial.printf("[HOME] tap page=%d slot=%d (x=%d y=%d)\n", s_home_page, slot, tap_x, tap_y);
+
+                if (s_home_page == 0) {
+                    switch (slot) {
+                        case 0: // ── RECORD ─────────────────────────────────
+                            if (start_i2s_recording()) {
+                                s_state = RECORDING;
+                                s_rec_start = s_ui_refresh = now;
+                                uiRecording(0);
+                            } else {
+                                uiStatus("Mic failed", "check PSRAM=OPI in IDE", TFT_RED);
+                                delay(2500); uiIdle();
+                            }
+                            break;
+                        case 1: // ── CAMERA ─────────────────────────────────
+                            uiStatus("Starting camera...", nullptr, DL_CAM);
+                            { bool cam_ok = cam_init();
+                              s_state = CAMERA_VIEW;
+                              uiCamera(cam_ok); }
+                            break;
+                        case 2: // ── IDEAS ──────────────────────────────────
+                            s_scroll_top = 0;
+                            s_state = LIST_VIEW;
+                            uiNotesList();
+                            break;
+                        case 3: // ── DICT ───────────────────────────────────
+                            s_kb_len = 0; s_kb_input[0] = '\0';
+                            s_state = DICT_KB;
+                            uiDictKeyboard();
+                            break;
                     }
                 } else {
-                    if (tap_x < 120) {
-                        // ── NOTES icon (bottom-left) ──────────────────────
-                        s_scroll_top = 0;
-                        s_state = LIST_VIEW;
-                        uiNotesList();
-                    } else {
-                        // ── DICT icon (bottom-right) ──────────────────────
-                        s_kb_len = 0; s_kb_input[0] = '\0';
-                        s_state = DICT_KB;
-                        uiDictKeyboard();
+                    switch (slot) {
+                        case 0: // ── ASK ────────────────────────────────────
+                            if (WiFi.status() != WL_CONNECTED) {
+                                uiStatus("WiFi needed", "for AI Ask", DL_ERR);
+                                delay(1800); uiIdle();
+                            } else {
+                                s_ask_has_photo = false;
+                                s_state = ASK_HOME;
+                                uiAskHome();
+                            }
+                            break;
+                        case 1: // ── WIFI ───────────────────────────────────
+                            s_prev_state = IDLE;
+                            s_scan_done  = false;
+                            s_scan_count = 0;
+                            s_state = WIFI_PANEL;
+                            uiWifiPanel(true);
+                            break;
+                        default: // reserved slots — no app yet
+                            break;
                     }
                 }
             }
-            // Swipe left → notes (kept as shortcut)
             if (tevt == T_SWIPE_LEFT && now - s_timer > 400) {
-                s_scroll_top = 0;
-                s_state = LIST_VIEW;
                 s_timer = now;
-                uiNotesList();
+                if (s_home_page < 1) {
+                    s_home_page++;
+                    Serial.printf("[HOME] page -> %d\n", s_home_page);
+                    uiIdle();
+                }
             }
-            // Swipe right → camera
             if (tevt == T_SWIPE_RIGHT && now - s_timer > 400) {
                 s_timer = now;
-                uiStatus("Starting camera...", nullptr, DL_CAM);
-                bool cam_ok = cam_init();
-                s_state = CAMERA_VIEW;
-                uiCamera(cam_ok);
-            }
-            // Swipe up → Dictionary keyboard
-            if (tevt == T_SWIPE_UP && now - s_timer > 400) {
-                s_kb_len = 0; s_kb_input[0] = '\0';
-                s_state = DICT_KB;
-                s_timer = now;
-                uiDictKeyboard();
-            }
-            // Swipe down → WiFi panel
-            if (tevt == T_SWIPE_DOWN && now - s_timer > 400) {
-                s_prev_state = IDLE;
-                s_scan_done  = false;
-                s_scan_count = 0;
-                s_state = WIFI_PANEL;
-                uiWifiPanel(true);
-                s_timer = now;
+                if (s_home_page > 0) {
+                    s_home_page--;
+                    Serial.printf("[HOME] page -> %d\n", s_home_page);
+                    uiIdle();
+                }
             }
             break;
+
+        // ── IDLE_CLOCK ───────────────────────────────────────────────────────
+        // Screensaver — friendly ticking clock face, driven by the PCF8563 RTC.
+        case IDLE_CLOCK: {
+            static int      s_clock_min     = -1;
+            static int      s_cur_hour      = 0;
+            static uint32_t s_blink_t       = 0;
+            static uint32_t s_last_rtc_read = 0;
+            static int      s_cur_sec       = 0;
+            static bool     s_rtc_read_ok   = true;   // edge-detect I2C read failures
+
+            // Poll the RTC over I2C at most 5x/sec — no need to hammer it every loop().
+            if (now - s_last_rtc_read >= 200) {
+                s_last_rtc_read = now;
+                int h, m, sec;
+                bool ok = rtc_get_time(h, m, sec);
+                if (ok != s_rtc_read_ok) {
+                    Serial.printf("[CLOCK] rtc_get_time %s\n", ok ? "recovered" : "FAILED (I2C)");
+                    s_rtc_read_ok = ok;
+                }
+                if (ok) {
+                    s_cur_sec = sec;
+                    if (m != s_clock_min || s_ui_refresh == 0) {
+                        Serial.printf("[CLOCK] draw face %02d:%02d\n", h, m);
+                        uiClockFace(h, m);
+                        s_clock_min  = m;
+                        s_cur_hour   = h;
+                        s_ui_refresh = now;
+                        s_blink_t    = now;
+                    }
+                }
+            }
+            // Center-hub second pulse — cheap "ticking" feel without a full redraw
+            if (now - s_ui_refresh >= 1000) {
+                s_ui_refresh = now;
+                tft.fillCircle(120, 120, 4, (s_cur_sec % 2 == 0) ? DL_INK_FIXED : DL_TEXT3);
+            }
+            // Occasional blink for personality
+            if (now - s_blink_t > 4000) {
+                s_blink_t = now;
+                uiClockBlink(true, s_cur_hour, s_clock_min);
+                delay(160);
+                uiClockBlink(false, s_cur_hour, s_clock_min);
+            }
+            if (tevt == T_TAP || tevt == T_SWIPE_LEFT || tevt == T_SWIPE_RIGHT ||
+                tevt == T_SWIPE_UP || tevt == T_SWIPE_DOWN) {
+                Serial.println("[CLOCK] touch -> exit screensaver");
+                s_clock_min = -1;  // force a full redraw next time we enter
+                s_state = IDLE;
+                s_last_activity = now;
+                s_timer = now;
+                uiIdle();
+            }
+            break;
+        }
 
         // ── RECORDING ────────────────────────────────────────────────────────
         case RECORDING:
@@ -1516,7 +1964,10 @@ void loop() {
                     delay(2000); uiIdle(); s_state = IDLE; s_timer = millis(); break;
                 }
                 if (!s_wifi_ok) {
-                    uiStatus("No WiFi", "can't transcribe", TFT_RED);
+                    sd_reinit(tft.getSPIinstance());
+                    savePendingAudio(get_audio_buffer(), get_audio_buffer_size());
+                    sd_release();
+                    uiStatus("Saved for retry", "no WiFi — will upload later", DL_WARN);
                     delay(2500); uiIdle(); s_state = IDLE; s_timer = millis(); break;
                 }
                 uiStatus("Sending idea...", "please wait");
@@ -1698,8 +2149,14 @@ void loop() {
         //   Bottom-centre (circle r=28 at 120,205): SHUTTER — only this captures
         //   Bottom-right (x>180, y>185): back to IDLE
         case CAMERA_VIEW:
-            // Live preview
-            cam_preview_frame();
+            // Live preview — false means the sensor stalled this frame (it
+            // self-heals internally after ~1.5s of no frames; this is just
+            // a visible hint while that's happening, not an error state).
+            if (!cam_preview_frame()) {
+                tft.fillCircle(120, 18, 9, DL_ERR);
+                tft.setTextFont(1); tft.setTextColor(TFT_WHITE, DL_ERR);
+                tft.drawCentreString("!", 120, 14, 1);
+            }
 
             // ── Overlay drawn on top of every frame ──────────────────────────
             // Shutter button — large white circle, unmistakable
@@ -1753,6 +2210,7 @@ void loop() {
                     snprintf(msg, sizeof(msg), "Photo %d saved!", s_photo_counter);
                     uiStatus(msg, "tap to shoot again", DL_CAM);
                     delay(1500);
+                    syncPhotoToTelegram(s_photo_counter);  // after feedback, not before
                 } else {
                     uiStatus("Capture failed", nullptr, TFT_RED);
                     delay(1500);
@@ -2213,6 +2671,170 @@ void loop() {
             else if (tevt == T_SWIPE_DOWN && s_detail_scroll > 0) {
                 s_detail_scroll--;
                 uiWordDetail(s_detail_rank, s_transcript, s_detail_scroll);
+                s_timer = now;
+            }
+            break;
+
+        // ── ASK_HOME ──────────────────────────────────────────────────────────
+        case ASK_HOME:
+            if (now - s_timer < 300) break;
+            if (tevt == T_SWIPE_RIGHT) {
+                s_state = IDLE; uiIdle(); s_timer = now;
+            } else if (tevt == T_TAP) {
+                int tap_y = (int)s_swipe_start_y;
+                if (tap_y < 115) {
+                    // Photo + Voice — start camera preview
+                    uiStatus("Starting camera...", nullptr, DL_ASK);
+                    if (cam_init()) {
+                        s_state = ASK_CAM;
+                    } else {
+                        uiStatus("Camera failed", nullptr, DL_ERR);
+                        delay(1500); uiAskHome();
+                    }
+                } else {
+                    // Voice only — start recording immediately
+                    if (start_i2s_recording()) {
+                        s_ask_has_photo = false;
+                        s_state = ASK_VOICE;
+                        s_rec_start = s_ui_refresh = now;
+                        uiAskVoice(0, false);
+                    } else {
+                        uiStatus("Mic failed", nullptr, DL_ERR);
+                        delay(1500); uiAskHome();
+                    }
+                }
+                s_timer = now;
+            }
+            break;
+
+        // ── ASK_CAM ───────────────────────────────────────────────────────────
+        case ASK_CAM:
+            if (!cam_preview_frame()) {
+                tft.fillCircle(120, 18, 9, DL_ERR);
+                tft.setTextFont(1); tft.setTextColor(TFT_WHITE, DL_ERR);
+                tft.drawCentreString("!", 120, 14, 1);
+            }
+            // Overlay — instructional pill at bottom
+            tft.fillRoundRect(20, 193, 200, 26, 8, 0x0820);
+            tft.setTextFont(2);
+            tft.setTextColor(DL_ASK, 0x0820);
+            tft.drawCentreString("TAP TO CAPTURE", 120, 199, 2);
+
+            if (now - s_timer < 350) break;
+            if (tevt == T_TAP) {
+                uiStatus("Capturing...", nullptr, DL_ASK);
+                cam_capture_to_mem(&s_ask_jpeg, &s_ask_jpg_sz);
+                cam_deinit();
+                s_ask_has_photo = (s_ask_jpeg != nullptr);
+                if (start_i2s_recording()) {
+                    s_state = ASK_VOICE;
+                    s_rec_start = s_ui_refresh = now;
+                    uiAskVoice(0, s_ask_has_photo);
+                } else {
+                    if (s_ask_jpeg) { free(s_ask_jpeg); s_ask_jpeg = nullptr; s_ask_has_photo = false; }
+                    uiStatus("Mic failed", nullptr, DL_ERR);
+                    delay(1500); s_state = IDLE; uiIdle();
+                }
+                s_timer = now;
+            } else if (tevt == T_SWIPE_RIGHT) {
+                cam_deinit();
+                s_state = ASK_HOME; uiAskHome(); s_timer = now;
+            }
+            break;
+
+        // ── ASK_VOICE ─────────────────────────────────────────────────────────
+        case ASK_VOICE:
+            if (now - s_ui_refresh > 800) {
+                s_ui_refresh = now;
+                uiAskVoice(now - s_rec_start, s_ask_has_photo);
+            }
+            // Auto-stop at 10s, or tap
+            if ((tevt == T_TAP && now - s_timer > 1000) || (now - s_rec_start > 10000)) {
+                stop_i2s_recording();
+                uiStatus("Thinking...", "transcribing...", DL_ASK);
+                s_state = ASK_THINK;
+                s_timer = now;
+            }
+            break;
+
+        // ── ASK_THINK ─────────────────────────────────────────────────────────
+        // Blocking state: wait for I2S to drain, then transcribe + ask AI + save
+        case ASK_THINK:
+            if (!is_recording()) {
+                // Step 1: transcribe voice question
+                memset(s_transcript, 0, sizeof(s_transcript));
+                bool ok = deepgram_transcribe(
+                    get_audio_buffer(), get_audio_buffer_size(),
+                    s_transcript, sizeof(s_transcript) - 1);
+
+                if (!ok) {
+                    if (s_ask_jpeg) { free(s_ask_jpeg); s_ask_jpeg = nullptr; s_ask_has_photo = false; }
+                    uiStatus("Upload failed", "need faster WiFi", DL_ERR);
+                    delay(2500); s_state = IDLE; uiIdle(); s_timer = millis(); break;
+                }
+                if (strlen(s_transcript) == 0) {
+                    if (s_ask_jpeg) { free(s_ask_jpeg); s_ask_jpeg = nullptr; s_ask_has_photo = false; }
+                    uiStatus("Didn't catch that", "speak louder & closer", DL_ERR);
+                    delay(2500); s_state = IDLE; uiIdle(); s_timer = millis(); break;
+                }
+                Serial.printf("[ASK] Question: %s\n", s_transcript);
+
+                // Step 2: call OpenRouter
+                uiStatus("Thinking...", "asking AI...", DL_ASK);
+                memset(s_ask_result, 0, sizeof(s_ask_result));
+
+                if (s_ask_has_photo && s_ask_jpeg) {
+                    ok = openrouter_ask_vision(s_transcript, s_ask_jpeg, s_ask_jpg_sz,
+                                               s_ask_result, sizeof(s_ask_result) - 1);
+                    free(s_ask_jpeg); s_ask_jpeg = nullptr; s_ask_has_photo = false;
+                } else {
+                    char ctx[512] = {0};
+                    sd_reinit(tft.getSPIinstance());
+                    buildNotesContext(ctx, sizeof(ctx));
+                    sd_release();
+                    ok = openrouter_ask_text(s_transcript, ctx,
+                                             s_ask_result, sizeof(s_ask_result) - 1);
+                }
+
+                if (!ok || strlen(s_ask_result) == 0) {
+                    strncpy(s_ask_result, "No response received. Check WiFi and API key.",
+                            sizeof(s_ask_result) - 1);
+                }
+
+                // Step 3: save as note "Q: ...\nA: ..."
+                char note_buf[900];
+                snprintf(note_buf, sizeof(note_buf), "Q: %.250s\nA: %.600s",
+                         s_transcript, s_ask_result);
+                s_note_counter++;
+                s_note_count++;
+                sd_reinit(tft.getSPIinstance());
+                saveNote(s_note_counter, note_buf);
+                int cached = min(s_note_count, MAX_NOTES_CACHE);
+                for (int r = cached - 1; r > 0; r--)
+                    memcpy(s_previews[r], s_previews[r-1], PREVIEW_CHARS + 1);
+                strncpy(s_previews[0], note_buf, PREVIEW_CHARS);
+                s_previews[0][PREVIEW_CHARS] = '\0';
+                sd_release();
+
+                s_ask_scroll = 0;
+                s_state = ASK_RESULT;
+                uiAskResult(s_ask_result, true);
+                s_timer = millis();
+            }
+            break;
+
+        // ── ASK_RESULT ────────────────────────────────────────────────────────
+        case ASK_RESULT:
+            if (now - s_timer < 300) break;
+            if (tevt == T_TAP || tevt == T_SWIPE_RIGHT) {
+                s_state = IDLE; uiIdle(); s_timer = now;
+            } else if (tevt == T_SWIPE_UP) {
+                s_ask_scroll++;
+                uiAskResult(s_ask_result, true);
+                s_timer = now;
+            } else if (tevt == T_SWIPE_DOWN && s_ask_scroll > 0) {
+                s_ask_scroll--;
+                uiAskResult(s_ask_result, true);
                 s_timer = now;
             }
             break;
