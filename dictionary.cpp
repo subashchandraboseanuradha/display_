@@ -101,6 +101,72 @@ static void sd_lookup(const char* word,
     if (!*en_found && !*ta_found) Serial.printf("[DICT-SD] miss (or dict files absent): %s\n", word);
 }
 
+// Autocomplete: lower-bound binary search for `prefix` in /dict_en.bin, then
+// collect consecutive records that still start with it. Same fixed-record
+// layout as sd_binary_search — only the compare length differs (prefix, not
+// the full 24-byte field).
+int dict_suggest(const char* prefix, char out[][24], int max_out) {
+    size_t plen = strlen(prefix);
+    if (plen == 0 || max_out <= 0) return 0;
+
+    int found = 0;
+    sd_reinit(tft.getSPIinstance());
+    if (SD.exists("/dict_en.bin")) {
+        File f = SD.open("/dict_en.bin", FILE_READ);
+        if (f) {
+            uint32_t file_size = f.size();
+            long n = (long)(file_size / EN_RECORD_LEN);
+            uint8_t rec[EN_RECORD_LEN];
+
+            // Lower bound: first record whose word >= prefix
+            long lo = 0, hi = n;
+            while (lo < hi) {
+                long mid = lo + (hi - lo) / 2;
+                if (!f.seek((uint32_t)mid * EN_RECORD_LEN)) { lo = n; break; }
+                if (f.read(rec, EN_RECORD_LEN) != EN_RECORD_LEN) { lo = n; break; }
+                if (strncmp((const char*)rec, prefix, plen) < 0) lo = mid + 1;
+                else hi = mid;
+            }
+
+            // Collect matches from the lower bound forward
+            for (long i = lo; i < n && found < max_out; i++) {
+                if (!f.seek((uint32_t)i * EN_RECORD_LEN)) break;
+                if (f.read(rec, EN_RECORD_LEN) != EN_RECORD_LEN) break;
+                if (strncmp((const char*)rec, prefix, plen) != 0) break;
+                strncpy(out[found], (const char*)rec, 23);
+                out[found][23] = '\0';
+                found++;
+            }
+            f.close();
+        }
+    }
+    sd_release();
+    return found;
+}
+
+// English sentence → Tamil, LLM only (no offline path for sentences).
+bool translate_text(const char* english, char* out, size_t out_max) {
+    out[0] = '\0';
+    if (!english || english[0] == '\0') return false;
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("[TRANS] WiFi not connected");
+        return false;
+    }
+    char prompt[560];
+    snprintf(prompt, sizeof(prompt),
+        "Translate this English text to Tamil for a Tamil-speaking English learner: \"%.320s\". "
+        "Reply in EXACTLY 2 lines, nothing else:\n"
+        "TA: Tamil translation written in English letters\n"
+        "EN: the same meaning in very simple English words",
+        english);
+    if (!openrouter_ask_text(prompt, nullptr, out, out_max)) {
+        Serial.println("[TRANS] OpenRouter call failed");
+        return false;
+    }
+    Serial.printf("[TRANS] OK: %s\n", out);
+    return true;
+}
+
 // Strip {xx}...{/xx}-style formatting tokens Merriam-Webster sometimes embeds
 // in definition text (e.g. "{bc}", "{it}...{/it}"), copying everything else.
 static void mw_strip_tokens(char* dst, const char* src, size_t max) {

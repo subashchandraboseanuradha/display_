@@ -27,6 +27,7 @@
 #include <Wire.h>
 #include <WiFi.h>
 #include "esp_sleep.h"
+#include "driver/gpio.h"
 #define USE_TFT_ESPI_LIBRARY
 #include <TFT_eSPI.h>
 #include "lv_xiao_round_screen.h"
@@ -41,11 +42,48 @@
 #include "rtc.h"
 #include "clock_art.h"
 #include "icon_art.h"
+#include "char_art.h"
+#include "scene_art.h"
 #include "time.h"
 #include "secrets.h"
 
-#define IDLE_SLEEP_MS  60000UL   // 1 min idle → deep sleep
+#define IDLE_SLEEP_MS  60000UL   // 1 min idle on any passive screen → back home
 #define GPIO_TOUCH_INT GPIO_NUM_7  // TOUCH_INT = D7 on XIAO round display
+
+// ── Power (600 mAh battery) ───────────────────────────────────────────────────
+// Backlight is the biggest constant drain — PWM it instead of on/off, and dim
+// hard during the clock screensaver. CPU idles at 80MHz; camera preview and
+// TLS/network work bump to 240MHz and drop back after (APB stays 80MHz on the
+// S3 at these steps, so SPI display / I2S mic clocks are unaffected).
+#define BL_PIN         43
+#define BL_FULL       255
+#define BL_DIM         60        // screensaver brightness (~25%)
+#define CLOCK_SLEEP_MS 300000UL  // 5 min on clock face → deep sleep, touch wakes
+
+static void backlight_set(uint8_t duty) { ledcWrite(BL_PIN, duty); }
+static void cpu_fast() { setCpuFrequencyMhz(240); }
+static void cpu_norm() { setCpuFrequencyMhz(80); }
+
+// Fast wake: note/photo/word counts survive deep sleep in RTC memory, so
+// waking skips the ~3s SD mount + directory rescan. Previews (RAM only)
+// reload lazily the first time a list screen is opened after wake.
+RTC_DATA_ATTR static bool rtc_counts_valid = false;
+RTC_DATA_ATTR static int  rtc_note_count  = 0, rtc_note_counter  = 0;
+RTC_DATA_ATTR static int  rtc_word_count  = 0, rtc_word_counter  = 0;
+RTC_DATA_ATTR static int  rtc_photo_count = 0, rtc_photo_counter = 0;
+static bool s_previews_stale = false;
+static void loadAllPreviews();
+static void loadWordPreviews();
+
+// Reload list previews from SD after a fast wake, first time they're needed.
+static void ensurePreviewsFresh() {
+    if (!s_previews_stale) return;
+    s_previews_stale = false;
+    sd_reinit(tft.getSPIinstance());
+    loadAllPreviews();
+    loadWordPreviews();
+    sd_release();
+}
 
 extern "C" uint32_t ui_get_millis()            { return millis(); }
 extern "C" void     ui_log_event(const char* m) { Serial.println(m); }
@@ -106,6 +144,10 @@ extern "C" void     ui_log_event_v(const char*, ...) {}
 #define ASK_THINK    19   // transcribe + OpenRouter call (blocking)
 #define ASK_RESULT   20   // display AI answer (scrollable)
 #define IDLE_CLOCK   21   // idle screensaver — clock face, shown after inactivity
+#define TRANS_VOICE  22   // translate: recording english sentence
+#define TRANS_THINK  23   // translate: transcribe + LLM call (blocking)
+#define TRANS_RESULT 24   // translate: show Tamil result (scrollable)
+#define TRANS_KB     25   // translate: typing input (reuses dict keyboard)
 static int      s_state = IDLE;
 static uint32_t s_timer = 0;
 
@@ -134,6 +176,10 @@ static size_t   s_ask_jpg_sz    = 0;
 static bool     s_ask_has_photo = false;
 static char     s_ask_result[800] = {0};    // AI answer text
 static int      s_ask_scroll    = 0;        // scroll offset in ASK_RESULT view
+
+// ── Translate globals ─────────────────────────────────────────────────────────
+static char s_trans_view[900] = {0};  // combined english + TA/EN lines for display
+static int  s_trans_scroll    = 0;
 
 // Preview cache: rank 0 = newest note, rank 1 = second newest, …
 static char s_previews[MAX_NOTES_CACHE][PREVIEW_CHARS + 1];
@@ -295,8 +341,29 @@ void uiIdle() {
         tft.setTextColor(DL_INK_FIXED, TILE_BG);
         tft.drawCentreString(wcon ? "WiFi On" : "WiFi Off", T2X+36, T2Y+54, 2);
 
+        // ── TRANSLATE ───────────────────────────────────────────────
+        // No AI-mascot art yet — simple EN/TA speech-bubble glyph drawn as
+        // vectors on the same fixed-white tile (regenerate proper mascot art
+        // later if wanted; pipeline in design_language memory).
+        tft.fillRoundRect(T3X, T3Y, TW, TH, R, TILE_BG);
+        { int gx = T3X + 12, gy = T3Y + 7;
+          tft.fillRoundRect(gx, gy, 26, 18, 6, DL_REC);            // EN bubble
+          tft.fillTriangle(gx+6, gy+17, gx+14, gy+17, gx+7, gy+23, DL_REC);
+          tft.setTextFont(1); tft.setTextColor(TFT_WHITE, DL_REC);
+          tft.drawCentreString("EN", gx+13, gy+5, 1);
+          int hx = gx + 23, hy = gy + 23;
+          tft.fillRoundRect(hx, hy, 26, 18, 6, DL_NOT);            // TA bubble
+          tft.fillTriangle(hx+12, hy+17, hx+20, hy+17, hx+19, hy+23, DL_NOT);
+          tft.setTextColor(TFT_WHITE, DL_NOT);
+          tft.drawCentreString("TA", hx+13, hy+5, 1); }
+        tft.setTextColor(DL_INK_FIXED, TILE_BG);
+        tft.drawCentreString("Translate", T3X+36, T3Y+54, 2);
+        if (!wcon) {
+            tft.setTextFont(1); tft.setTextColor(DL_TEXT3, TILE_BG);
+            tft.drawCentreString("wifi needed", T3X+36, T3Y+68, 1);
+        }
+
         // ── (reserved for future apps) ────────────────────────────────
-        tft.drawRoundRect(T3X, T3Y, TW, TH, R, DL_LINE);
         tft.drawRoundRect(T4X, T4Y, TW, TH, R, DL_LINE);
     }
 
@@ -391,12 +458,40 @@ static void uiBootSplash() {
     }
 }
 
+// Camera needs 240MHz for a usable preview framerate — wrap init/deinit so
+// every camera session raises the clock and every exit drops it back.
+static bool cam_begin() {
+    cpu_fast();
+    bool ok = cam_init();
+    if (!ok) cpu_norm();
+    return ok;
+}
+static void cam_end() {
+    cam_deinit();
+    cpu_norm();
+}
+
 static void enterDeepSleep() {
+    Serial.println("[SLEEP] entering deep sleep");
+
+    // Counts survive in RTC memory → wake skips the slow SD rescan
+    rtc_note_count  = s_note_count;  rtc_note_counter  = s_note_counter;
+    rtc_word_count  = s_word_count;  rtc_word_counter  = s_word_counter;
+    rtc_photo_count = s_photo_count; rtc_photo_counter = s_photo_counter;
+    rtc_counts_valid = true;
+
     tft.fillScreen(DL_BG);
     tft.setTextColor(DL_TEXT3, DL_BG);
     tft.drawCentreString("Sleeping...", 120, 112, 2);
     delay(600);
-    digitalWrite(43, LOW);  // backlight off
+
+    // LEDC dies in deep sleep and its pin floats — a floating backlight pin
+    // glows/flickers. Drive it LOW as plain GPIO and latch it through sleep.
+    ledcDetach(BL_PIN);
+    pinMode(BL_PIN, OUTPUT);
+    digitalWrite(BL_PIN, LOW);
+    gpio_hold_en((gpio_num_t)BL_PIN);
+    gpio_deep_sleep_hold_en();
 
     // EXT0 is level-triggered (LOW=wake). If TOUCH_INT is still LOW
     // (CHSC6X holds INT asserted until touch data is read), ESP32 wakes instantly.
@@ -470,6 +565,7 @@ void uiStatus(const char* line1, const char* line2, uint16_t col = DL_TEXT1) {
 #define LIST_VISIBLE 5
 
 void uiNotesList() {
+    ensurePreviewsFresh();
     tft.fillScreen(DL_BG);
 
     // Header
@@ -498,15 +594,20 @@ void uiNotesList() {
         char badge[8]; snprintf(badge, sizeof(badge), "IDEA %d", num);
         tft.drawString(badge, 35, y + 2);
 
-        // Preview text
+        // Preview text — cache only holds MAX_NOTES_CACHE entries; older
+        // ranks have no cached preview (reading past the array is garbage).
         tft.setTextFont(2);
         tft.setTextColor(DL_TEXT1, DL_SURFACE);
         char prev[PREVIEW_CHARS + 4];
-        strncpy(prev, s_previews[rank], PREVIEW_CHARS);
-        prev[PREVIEW_CHARS] = '\0';
-        if (strlen(s_previews[rank]) >= PREVIEW_CHARS) {
-            prev[PREVIEW_CHARS - 2] = '.';
-            prev[PREVIEW_CHARS - 1] = '.';
+        if (rank < MAX_NOTES_CACHE) {
+            strncpy(prev, s_previews[rank], PREVIEW_CHARS);
+            prev[PREVIEW_CHARS] = '\0';
+            if (strlen(s_previews[rank]) >= PREVIEW_CHARS) {
+                prev[PREVIEW_CHARS - 2] = '.';
+                prev[PREVIEW_CHARS - 1] = '.';
+            }
+        } else {
+            strcpy(prev, "(tap to view)");
         }
         tft.drawString(prev, 35, y + 14);
     }
@@ -520,7 +621,7 @@ void uiNotesList() {
 
     tft.setTextFont(1);
     tft.setTextColor(DL_LINE, DL_BG);
-    tft.drawCentreString("tap header = record new", 120, 218, 1);
+    tft.drawCentreString("tap = open  |  swipe right = home", 120, 218, 1);
 }
 
 // ── Display: Screen 2 — note detail ──────────────────────────────────────────
@@ -801,30 +902,24 @@ void uiWifiPanel(bool scanning) {
 }
 
 // ── Display: Dictionary keyboard ─────────────────────────────────────────────
-// Circle r=115, centre (120,120). Safe x at each y:
-//   y=35 → x [43, 197]   y=185 → x [11, 229]   y=209 → x [49, 191]
-// Letter grid: 5 cols × 30 = 150px, left=44 → right=194. Safe at y=35 ✓
-// Special row: 5 keys × 28 = 140px, left=50 → right=190. Safe at y=209 ✓
+// Circle r=115, centre (120,120). 6×5 grid: A-Z in order plus backspace,
+// space, MIC and GO in the last row — no separate special row anymore.
+// A suggestion row (offline SD-dict autocomplete) sits between the input bar
+// and the grid. Grid x 36..204, y 68..198 — circle-safe at both extremes
+// (y=68 → x [17,223]; y=198 → x [35,205]) and keys are inset 2px anyway.
 
-#define KB_LX  44    // letter grid left   (was 30, unsafe at top of circle)
-#define KB_LY  35    // letter grid top    (was 40)
-#define KB_CW  30    // col width          (was 36)
-#define KB_RH  30    // row height
-#define KB_SX  50    // special row left   (was 37)
-#define KB_SY 187    // special row top    (was 194)
-#define KB_SW  28    // special key width  (was 33)
-#define KB_SH  22    // special row height (was 28, bottom now y=209)
+#define KB_LX     36   // grid left
+#define KB_LY     68   // grid top
+#define KB_CW     28   // col width  (6 cols → 168px)
+#define KB_RH     26   // row height (5 rows → 130px)
+#define KB_SUG_Y  36   // suggestion row top
+#define KB_SUG_H  26
 
 static char s_kb_input[32] = {0};
-static int  s_kb_len = 0;
-
-static const char KB_ALPHA[5][5] = {
-    {'A','B','C','D','E'},
-    {'F','G','H','I','J'},
-    {'K','L','M','N','O'},
-    {'P','Q','R','S','T'},
-    {'U','V','W','X','Y'}
-};
+static int  s_kb_len  = 0;
+static int  s_kb_mode = 0;        // 0 = dictionary lookup, 1 = translate
+static char s_suggest[2][24];     // offline autocomplete candidates
+static int  s_suggest_n = 0;
 
 static void drawKey(int x, int y, int w, int h,
                     const char* lbl, uint16_t bg, uint16_t fg, uint8_t fnt=2) {
@@ -834,57 +929,116 @@ static void drawKey(int x, int y, int w, int h,
     tft.drawCentreString(lbl, x + w/2, ty, fnt);
 }
 
-void uiDictKeyboard() {
-    tft.fillScreen(DL_BG);
-
-    // Input bar — centred, narrow enough to be safe even at top of circle
+// Input bar + suggestion row only — called per keypress so the grid (the
+// expensive part) isn't redrawn and the keyboard doesn't flicker.
+static void uiDictKbTop() {
     tft.fillRoundRect(44, 6, 152, 26, 6, DL_SURFACE2);
     tft.setTextColor(DL_TEXT1, DL_SURFACE2);
-    char disp[36];
-    snprintf(disp, sizeof(disp), s_kb_len ? "%s|" : "type a word...", s_kb_input);
+    // Long input (translate sentences) — show the tail, not the head
+    char shown[20];
+    if (s_kb_len > 16) snprintf(shown, sizeof(shown), "..%s", s_kb_input + s_kb_len - 14);
+    else               snprintf(shown, sizeof(shown), "%s", s_kb_input);
+    char disp[24];
+    if (s_kb_len) snprintf(disp, sizeof(disp), "%s|", shown);
+    else          snprintf(disp, sizeof(disp), "%s", s_kb_mode == 1 ? "type english..." : "type a word...");
     tft.drawCentreString(disp, 120, 12, 2);
 
-    // Letters A-Y — grid fits inside circle at all row heights (verified above)
-    for (int r = 0; r < 5; r++) {
-        for (int c = 0; c < 5; c++) {
-            char lbl[2] = {KB_ALPHA[r][c], '\0'};
-            drawKey(KB_LX + c*KB_CW, KB_LY + r*KB_RH, KB_CW, KB_RH,
-                    lbl, DL_SURFACE2, DL_TEXT1, 2);
-        }
+    // Suggestion pills — tap to use
+    tft.fillRect(36, KB_SUG_Y, 168, KB_SUG_H, DL_BG);
+    for (int i = 0; i < s_suggest_n; i++) {
+        int px = 42 + i * 82;   // two pills, 74 wide, 8px gap
+        tft.fillRoundRect(px, KB_SUG_Y, 74, 24, 8, DL_SURFACE);
+        tft.drawRoundRect(px, KB_SUG_Y, 74, 24, 8, DL_LINE);
+        tft.setTextColor(DL_DIC, DL_SURFACE);
+        char w[9]; strncpy(w, s_suggest[i], 8); w[8] = '\0';
+        tft.drawCentreString(w, px + 37, KB_SUG_Y + 5, 2);
     }
-
-    // Special row — circle-safe at y=187-209 (x=50-190 verified)
-    drawKey(KB_SX + 0*KB_SW, KB_SY, KB_SW, KB_SH, "Z",  DL_SURFACE2, DL_TEXT1,  2);
-    drawKey(KB_SX + 1*KB_SW, KB_SY, KB_SW, KB_SH, "<",  DL_LINE,     DL_TEXT1,  2);
-    drawKey(KB_SX + 2*KB_SW, KB_SY, KB_SW, KB_SH, "_",  DL_SURFACE,  DL_TEXT2,  1);
-    drawKey(KB_SX + 3*KB_SW, KB_SY, KB_SW, KB_SH, "MIC",DL_REC,      DL_TEXT1,  1);
-    drawKey(KB_SX + 4*KB_SW, KB_SY, KB_SW, KB_SH, "GO", DL_DIC,      DL_TEXT1,  1);
 }
 
-// Returns: 0=nothing, 1=redraw, 2=search/GO, 3=voice/MIC
-int kb_tap(int tap_x, int tap_y) {
-    // Special row
-    if (tap_y >= KB_SY) {
-        int col = (tap_x - KB_SX) / KB_SW;
-        if (col < 0 || col > 4) return 0;
-        switch (col) {
-            case 0: if (s_kb_len<30){s_kb_input[s_kb_len++]='Z';s_kb_input[s_kb_len]=0;} return 1;
-            case 1: if (s_kb_len>0) s_kb_input[--s_kb_len]=0; return 1;
-            case 2: if (s_kb_len<30){s_kb_input[s_kb_len++]=' ';s_kb_input[s_kb_len]=0;} return 1;
-            case 3: return 3;
-            case 4: return 2;
+void uiDictKeyboard() {
+    tft.fillScreen(DL_BG);
+    uiDictKbTop();
+
+    // A-Z in order + specials, one 6×5 grid
+    for (int r = 0; r < 5; r++) {
+        for (int c = 0; c < 6; c++) {
+            int idx = r * 6 + c;
+            int x = KB_LX + c * KB_CW, y = KB_LY + r * KB_RH;
+            if (idx < 26) {
+                char lbl[2] = {(char)('A' + idx), '\0'};
+                drawKey(x, y, KB_CW, KB_RH, lbl, DL_SURFACE2, DL_TEXT1, 2);
+            } else if (idx == 26) {
+                drawKey(x, y, KB_CW, KB_RH, "<",   DL_LINE,    DL_TEXT1, 2);
+            } else if (idx == 27) {
+                drawKey(x, y, KB_CW, KB_RH, "_",   DL_SURFACE, DL_TEXT2, 2);
+            } else if (idx == 28) {
+                drawKey(x, y, KB_CW, KB_RH, "MIC", DL_REC,     DL_TEXT1, 1);
+            } else {
+                drawKey(x, y, KB_CW, KB_RH, "GO",  DL_DIC,     DL_TEXT1, 1);
+            }
         }
     }
-    // Letter grid
-    if (tap_y < KB_LY) return 0;
+
+    tft.setTextFont(1);
+    tft.setTextColor(DL_TEXT3, DL_BG);
+    tft.drawCentreString("swipe down = home", 120, 210, 1);
+}
+
+// Returns: 0=nothing, 1=input changed, 2=GO, 3=MIC, 4/5=suggestion 0/1 tapped
+int kb_tap(int tap_x, int tap_y) {
+    // Suggestion row
+    if (tap_y >= KB_SUG_Y && tap_y < KB_SUG_Y + KB_SUG_H) {
+        for (int i = 0; i < s_suggest_n; i++) {
+            int px = 42 + i * 82;
+            if (tap_x >= px && tap_x < px + 74) return 4 + i;
+        }
+        return 0;
+    }
+    // Grid
+    if (tap_y < KB_LY || tap_x < KB_LX) return 0;
     int row = (tap_y - KB_LY) / KB_RH;
     int col = (tap_x - KB_LX) / KB_CW;
-    if (row < 0 || row > 4 || col < 0 || col > 4) return 0;
-    if (s_kb_len < 30) {
-        s_kb_input[s_kb_len++] = KB_ALPHA[row][col];
-        s_kb_input[s_kb_len]   = '\0';
+    if (row < 0 || row > 4 || col < 0 || col > 5) return 0;
+    int idx = row * 6 + col;
+    if (idx < 26) {
+        if (s_kb_len < 30) { s_kb_input[s_kb_len++] = (char)('A' + idx); s_kb_input[s_kb_len] = 0; }
+        return 1;
     }
-    return 1;
+    if (idx == 26) { if (s_kb_len > 0) s_kb_input[--s_kb_len] = 0; return 1; }
+    if (idx == 27) { if (s_kb_len < 30) { s_kb_input[s_kb_len++] = ' '; s_kb_input[s_kb_len] = 0; } return 1; }
+    if (idx == 28) return 3;
+    return 2;  // GO
+}
+
+// Refresh the autocomplete row from the offline SD dictionary. Prefix = the
+// last (partial) word typed, lowercased; needs 2+ letters to bother.
+static void fetchSuggestions() {
+    s_suggest_n = 0;
+    const char* last = strrchr(s_kb_input, ' ');
+    last = last ? last + 1 : s_kb_input;
+    char prefix[24] = {0};
+    int n = 0;
+    for (const char* p = last; *p && n < 23; p++) prefix[n++] = tolower(*p);
+    prefix[n] = '\0';
+    if (n >= 2) s_suggest_n = dict_suggest(prefix, s_suggest, 2);
+}
+
+// Replace the trailing partial word with suggestion i (translate mode).
+static void acceptSuggestion(int i) {
+    char* last = strrchr(s_kb_input, ' ');
+    int base = last ? (int)(last - s_kb_input) + 1 : 0;
+    snprintf(s_kb_input + base, sizeof(s_kb_input) - base, "%s ", s_suggest[i]);
+    for (int k = base; s_kb_input[k]; k++) s_kb_input[k] = toupper(s_kb_input[k]);
+    s_kb_len = strlen(s_kb_input);
+    if (s_kb_len > 30) { s_kb_len = 30; s_kb_input[30] = '\0'; }
+}
+
+// Fresh keyboard entry — resets input, mode, suggestions, and draws.
+static void enterDictKb(int mode) {
+    s_kb_mode = mode;
+    s_kb_len = 0; s_kb_input[0] = '\0';
+    s_suggest_n = 0;
+    uiDictKeyboard();
 }
 
 void uiDictListening(uint32_t elapsed_ms) {
@@ -916,11 +1070,20 @@ void uiDictResult(const char* definition, bool found, int rank = -1, int total =
         tft.drawString(pos_ind, 195, 5);
     }
     if (!found) {
+        // Offline, the lookup can only miss because the word isn't in the SD
+        // dictionary — "check spelling" would send the user retyping in vain.
+        bool offline = (WiFi.status() != WL_CONNECTED);
         tft.setTextColor(DL_ERR, DL_BG);
-        tft.drawCentreString("Word not found", 120, 95, 4);
+        tft.drawCentreString(offline ? "Offline" : "Word not found", 120, 90, 4);
         tft.setTextColor(DL_TEXT3, DL_BG);
-        tft.drawCentreString("Check spelling", 120, 128, 2);
-        tft.drawCentreString("tap = try again", 120, 155, 2);
+        if (offline) {
+            tft.drawCentreString("word not in SD dictionary", 120, 124, 2);
+            tft.drawCentreString("connect WiFi for full lookup", 120, 144, 2);
+            tft.drawCentreString("tap = try again", 120, 170, 2);
+        } else {
+            tft.drawCentreString("Check spelling", 120, 124, 2);
+            tft.drawCentreString("tap = try again", 120, 151, 2);
+        }
         return;
     }
     // Parse: "WORD\n(pos)\ndef text\nTA: tamil\neg. example" (lines 1-2 fixed, 3-4 optional)
@@ -987,6 +1150,7 @@ void uiDictResult(const char* definition, bool found, int rank = -1, int total =
 }
 
 void uiWordList(int scroll_top) {
+    ensurePreviewsFresh();
     tft.fillScreen(DL_BG);
     tft.setTextColor(DL_DIC, DL_BG);
     char hdr[22];
@@ -1007,7 +1171,9 @@ void uiWordList(int scroll_top) {
         tft.drawString(badge, 35, y + 2);
         tft.setTextFont(2);
         tft.setTextColor(DL_TEXT1, DL_SURFACE);
-        tft.drawString(s_word_previews[rank], 58, y + 12);
+        // Cache holds MAX_WORDS_CACHE entries — older ranks aren't cached.
+        tft.drawString(rank < MAX_WORDS_CACHE ? s_word_previews[rank] : "(tap to view)",
+                       58, y + 12);
     }
     if (scroll_top + LIST_VISIBLE < s_word_count) {
         tft.drawFastHLine(25, 196, 190, DL_LINE);
@@ -1127,6 +1293,54 @@ void uiAskResult(const char* answer, bool saved) {
     tft.drawCentreString("tap/swipe right = back  |  up/dn = scroll", 120, 210, 1);
 }
 
+// ── Display: Translate screens ────────────────────────────────────────────────
+
+void uiTransVoice(uint32_t elapsed_ms) {
+    tft.fillScreen(DL_BG);
+
+    int prog = min((int)((long)elapsed_ms * 360 / 10000), 360);
+    tft.drawArc(120, 120, 108, 100, 0, 360, DL_SURFACE2, DL_BG);
+    if (prog > 0) tft.drawArc(120, 120, 108, 100, 0, prog, DL_WIFI, DL_BG);
+
+    bool pulse = (elapsed_ms / 800) % 2 == 0;
+    tft.fillCircle(120, 76, 5, pulse ? DL_WIFI : DL_SURFACE2);
+
+    tft.setTextColor(DL_WIFI, DL_BG);
+    tft.drawCentreString("SPEAK", 120, 88, 4);
+    tft.setTextColor(DL_TEXT3, DL_BG);
+    tft.drawCentreString("english sentence", 120, 118, 2);
+
+    uint32_t s = elapsed_ms / 1000;
+    char t[10]; snprintf(t, sizeof(t), "%02lu:%02lu", s/60, s%60);
+    tft.setTextColor(DL_TEXT1, DL_BG);
+    tft.drawCentreString(t, 120, 140, 4);
+
+    tft.setTextColor(DL_TEXT2, DL_BG);
+    tft.drawCentreString("tap = translate", 120, 176, 2);
+    tft.setTextFont(1);
+    tft.setTextColor(DL_TEXT3, DL_BG);
+    tft.drawCentreString("swipe up = type instead", 120, 202, 1);
+}
+
+void uiTransResult() {
+    tft.fillScreen(DL_BG);
+    tft.setTextColor(DL_WIFI, DL_BG);
+    tft.drawCentreString("TRANSLATE", 120, 9, 2);
+    tft.setTextFont(1);
+    tft.setTextColor(DL_OK, DL_BG);
+    tft.drawString("saved", 178, 10);
+    tft.drawFastHLine(28, 26, 184, DL_WIFI);
+
+    bool more = drawWrappedText(s_trans_view, 30, 33, 180, 200, s_trans_scroll);
+    tft.setTextFont(1); tft.setTextColor(DL_TEXT3, DL_BG);
+    if (s_trans_scroll > 0) tft.drawCentreString("^", 202, 38, 1);
+    if (more)               tft.drawCentreString("v", 202, 185, 1);
+
+    tft.drawFastHLine(35, 203, 170, DL_LINE);
+    tft.setTextColor(DL_TEXT3, DL_BG);
+    tft.drawCentreString("tap = again  |  swipe right = home", 120, 210, 1);
+}
+
 // Shared footer — circle-safe at y=210 (x≈40-200). Tap x<120=BACK, x>120=DELETE
 static void uiDetailFooter() {
     tft.drawFastHLine(40, 203, 160, DL_LINE);
@@ -1138,13 +1352,21 @@ static void uiDetailFooter() {
 }
 
 void uiDeleteConfirm(const char* label) {
-    // Overlay asking for second tap to confirm
+    // Overlay asking for a confirming tap INSIDE the red box.
+    // Tap outside the box cancels — see tapInDeleteBox() users.
     tft.fillRoundRect(30, 85, 180, 70, 12, DL_ERR);
     tft.setTextColor(TFT_WHITE, DL_ERR);
-    tft.drawCentreString("DELETE?", 120, 98, 4);
+    tft.drawCentreString("DELETE?", 120, 96, 4);
     tft.setTextFont(1);
-    tft.drawCentreString(label, 120, 130, 1);
-    tft.drawCentreString("TAP AGAIN TO CONFIRM", 120, 145, 1);
+    tft.drawCentreString(label, 120, 126, 1);
+    tft.drawCentreString("TAP HERE TO DELETE", 120, 140, 1);
+    tft.setTextColor(DL_TEXT2, DL_BG);
+    tft.drawCentreString("tap outside box = cancel", 120, 162, 1);
+}
+
+// True when the tap landed inside the uiDeleteConfirm red box (30,85 180x70).
+static bool tapInDeleteBox(int x, int y) {
+    return x >= 30 && x <= 210 && y >= 85 && y <= 155;
 }
 
 // ── Pending audio: save failed transcriptions, retry on next WiFi ─────────────
@@ -1257,14 +1479,16 @@ static void retryPendingNotes() {
             strncpy(s_previews[0], transcript, PREVIEW_CHARS);
             s_previews[0][PREVIEW_CHARS] = '\0';
             Serial.printf("[PEND] Recovered → note_%03d\n", s_note_counter);
-        } else if (perm && pcm_size < get_bytes_per_sec()) {
-            // < 1 second + no speech = accidental tap, junk
+        } else if (perm) {
+            // DeepGram answered and heard no speech — retrying the same file
+            // every boot never succeeds, it just adds ~10s per file to every
+            // cold boot (seen on-device: 2 dead files retried forever).
             SD.remove(path);
             s_pending_count--;
-            Serial.printf("[PEND] Too short + no speech — deleted %s\n", path);
+            Serial.printf("[PEND] No speech in %s — deleted (won't retry)\n", path);
         } else {
-            // Network error OR substantial audio DeepGram couldn't parse — keep
-            Serial.printf("[PEND] Keeping %s (perm=%d size=%u)\n", path, perm, (unsigned)pcm_size);
+            // Network error — audio may still be good, keep for next boot
+            Serial.printf("[PEND] Keeping %s (network error, size=%u)\n", path, (unsigned)pcm_size);
         }
     }
 }
@@ -1616,8 +1840,43 @@ static bool loadNoteText(int rank, char* buf, size_t max) {
     return true;
 }
 
+// Translate `english` via LLM, save as a note (mirrors to Telegram through
+// saveNote), and build the TRANS_RESULT view. False = translation call
+// failed — caller decides which screen to fall back to.
+static bool doTranslate(const char* english) {
+    uiStatus("Translating...", nullptr, DL_WIFI);
+    char result[400] = {0};
+    cpu_fast();
+    bool ok = translate_text(english, result, sizeof(result) - 1);
+    cpu_norm();
+    if (!ok || result[0] == '\0') return false;
+
+    snprintf(s_trans_view, sizeof(s_trans_view), "%s\n\n%s", english, result);
+    s_trans_scroll = 0;
+
+    char note_buf[900];
+    snprintf(note_buf, sizeof(note_buf), "TR: %.300s\n%.500s", english, result);
+    s_note_counter++;
+    s_note_count++;
+    sd_reinit(tft.getSPIinstance());
+    saveNote(s_note_counter, note_buf);
+    int cached = min(s_note_count, MAX_NOTES_CACHE);
+    for (int r = cached - 1; r > 0; r--)
+        memcpy(s_previews[r], s_previews[r-1], PREVIEW_CHARS + 1);
+    strncpy(s_previews[0], note_buf, PREVIEW_CHARS);
+    s_previews[0][PREVIEW_CHARS] = '\0';
+    sd_release();
+    return true;
+}
+
 // ── WiFi ──────────────────────────────────────────────────────────────────────
 static bool s_wifi_ok = false;
+// Last successful network, kept in RTC slow memory — survives deep sleep
+// (not cold boot). Needed because arduino-esp32 does NOT persist WiFi
+// credentials to NVS by default: the old bare WiFi.begin() on the wake path
+// had nothing stored to connect with, so WiFi was dead after every deep sleep.
+RTC_DATA_ATTR static char s_rtc_ssid[33] = {0};
+RTC_DATA_ATTR static char s_rtc_pass[65] = {0};
 #define TZ_OFFSET_SEC 19800   // IST, UTC+5:30 — change if you're outside India
 
 static void wifiConnect() {
@@ -1672,6 +1931,9 @@ static void wifiConnect() {
     }
     if (WiFi.status() == WL_CONNECTED) {
         s_wifi_ok = true;
+        WiFi.setAutoReconnect(true);
+        strncpy(s_rtc_ssid, SAVED_SSIDS[best_saved], 32); s_rtc_ssid[32] = '\0';
+        strncpy(s_rtc_pass, SAVED_PASS[best_saved],  64); s_rtc_pass[64] = '\0';
         Serial.printf("[WiFi] %s\n", WiFi.localIP().toString().c_str());
         tft.setTextColor(DL_OK, DL_BG);
         tft.drawCentreString("WiFi OK", 120, 147, 2);
@@ -1696,6 +1958,7 @@ static void wifiConnect() {
         }
     } else {
         s_wifi_ok = false;
+        WiFi.disconnect();  // stop the driver retrying in the background
         Serial.println("[WiFi] FAILED — offline");
         tft.setTextColor(DL_ERR, DL_BG);
         tft.drawCentreString("WiFi FAILED", 120, 147, 2);
@@ -1705,21 +1968,41 @@ static void wifiConnect() {
 
 // ── Setup ─────────────────────────────────────────────────────────────────────
 void setup() {
-    Serial.begin(115200);
-    delay(800);
-
     bool from_sleep = (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0);
+
+    Serial.begin(115200);
+    delay(from_sleep ? 100 : 800);  // wake must feel instant — skip serial settle
 
     Serial.println("\n========================================");
     Serial.printf("[MAIN][T+%lums] BOOT — %s\n", millis(), from_sleep ? "wake from sleep" : "cold boot");
     Serial.println("========================================");
 
+    // Log WHY every WiFi drop/failure happens — reason codes tell apart wrong
+    // password (2/15), AP not found (201), assoc expired (4), AP full (5)...
+    WiFi.onEvent([](WiFiEvent_t e, WiFiEventInfo_t info) {
+        if (e == ARDUINO_EVENT_WIFI_STA_DISCONNECTED)
+            Serial.printf("[WiFi] DISCONNECTED reason=%d rssi=%d\n",
+                          (int)info.wifi_sta_disconnected.reason,
+                          (int)info.wifi_sta_disconnected.rssi);
+        else if (e == ARDUINO_EVENT_WIFI_STA_CONNECTED)
+            Serial.println("[WiFi] EVENT: associated with AP");
+        else if (e == ARDUINO_EVENT_WIFI_STA_GOT_IP)
+            Serial.println("[WiFi] EVENT: got IP");
+    });
+
+    // No background retry storm: a failed WiFi.begin() otherwise auto-retries
+    // ~1/sec forever (observed on-device: endless reason=4 drops, which also
+    // trips router auth-flood protection). The 60s watchdog in loop() is the
+    // sole retry path; auto-reconnect turns on only after a confirmed connect.
+    WiFi.setAutoReconnect(false);
+
     Wire.begin(5, 6);
     s_rtc_ok = rtc_init();
     tft.begin();
     tft.setRotation(1);  // 90° CW — matches case mounting orientation
-    pinMode(43, OUTPUT);
-    digitalWrite(43, HIGH);
+    gpio_hold_dis((gpio_num_t)BL_PIN);  // release deep-sleep latch before PWM attach
+    ledcAttach(BL_PIN, 5000, 8);   // PWM backlight — dimmable, 5kHz, 8-bit
+    backlight_set(BL_FULL);
     Serial.printf("[MAIN] Display OK.\n");
 
     if (!from_sleep) {
@@ -1729,19 +2012,30 @@ void setup() {
         tft.drawCentreString("Checking SD...", 120, 108, 2);
     }
 
-    bool sd_ok = init_sd_card(tft.getSPIinstance());
-    if (!sd_ok) {
-        tft.fillScreen(DL_BG);
-        tft.setTextColor(DL_ERR, DL_BG);
-        tft.drawCentreString("SD FAILED", 120, 140, 4);
-        while (true) delay(1000);
+    if (from_sleep && rtc_counts_valid) {
+        // Fast wake: counts were saved to RTC memory at sleep — skip the
+        // ~3s SD mount + rescan. Previews reload lazily on first list open.
+        s_note_count  = rtc_note_count;  s_note_counter  = rtc_note_counter;
+        s_word_count  = rtc_word_count;  s_word_counter  = rtc_word_counter;
+        s_photo_count = rtc_photo_count; s_photo_counter = rtc_photo_counter;
+        s_previews_stale = true;
+        Serial.printf("[MAIN] fast wake: %d notes / %d photos / %d words (RTC cache)\n",
+                      s_note_count, s_photo_count, s_word_count);
+    } else {
+        bool sd_ok = init_sd_card(tft.getSPIinstance());
+        if (!sd_ok) {
+            tft.fillScreen(DL_BG);
+            tft.setTextColor(DL_ERR, DL_BG);
+            tft.drawCentreString("SD FAILED", 120, 140, 4);
+            while (true) delay(1000);
+        }
+        sd_reinit(tft.getSPIinstance());
+        scanAndLoadNotes();
+        cam_scan_photos();
+        scanAndLoadWords();
+        scanPendingAudio();
+        sd_release();
     }
-    sd_reinit(tft.getSPIinstance());
-    scanAndLoadNotes();
-    cam_scan_photos();
-    scanAndLoadWords();
-    scanPendingAudio();
-    sd_release();
 
     if (!from_sleep) {
         tft.setTextColor(DL_OK, DL_BG);
@@ -1757,12 +2051,25 @@ void setup() {
         }
         if (s_wifi_ok) backfillTelegramSync();
     } else {
-        // Wake from sleep: reconnect WiFi in background, don't block UI
-        WiFi.begin();
+        // Wake from sleep: reconnect in background with the RTC-remembered
+        // network. Bare WiFi.begin() had nothing to connect with — arduino-
+        // esp32 doesn't persist credentials by default, so WiFi was dead
+        // after every deep sleep.
+        if (s_rtc_ssid[0]) {
+            WiFi.mode(WIFI_STA);
+            WiFi.begin(s_rtc_ssid, s_rtc_pass);
+            WiFi.setAutoReconnect(true);
+        }
     }
 
     mic_init();
     battery_init();
+
+    // Power: radio sleeps between DTIM beacons; CPU idles at 80MHz from here
+    // (boot/WiFi/backfill above ran at the full 240MHz default).
+    WiFi.setSleep(true);
+    cpu_norm();
+
     Serial.printf("[MAIN] READY.\n");
     uiIdle();
     s_state = IDLE;
@@ -1778,6 +2085,41 @@ void loop() {
     uint32_t now  = millis();
     int      tevt = checkTouch();
 
+    // WiFi watchdog: on-device logs showed the radio driver can die
+    // mid-session ("wifi:Set status to INIT" flood) and nothing ever
+    // restarted it — WiFi stayed dead until reboot. WiFi.begin() restarts
+    // the driver, so retry the last good network once a minute while down.
+    static uint32_t s_wifi_retry_t = 0;
+    if (s_rtc_ssid[0] && WiFi.status() != WL_CONNECTED &&
+        now - s_wifi_retry_t > 60000UL) {
+        s_wifi_retry_t = now;
+        Serial.println("[WiFi] watchdog: driver down/disconnected — reconnecting");
+        WiFi.mode(WIFI_STA);
+        WiFi.begin(s_rtc_ssid, s_rtc_pass);
+    }
+
+    // Battery guard: forgotten on a passive screen (list/detail/result/panel),
+    // return home after IDLE_SLEEP_MS — from there the normal clock
+    // screensaver takes over. States with hardware live (mic, camera) or
+    // blocking work in flight are excluded. Signed cast: same wrap hazard as
+    // the IDLE screensaver check below.
+    switch (s_state) {
+        case LIST_VIEW: case NOTE_DETAIL: case PHOTO_GALLERY: case PHOTO_DETAIL:
+        case WIFI_PANEL: case DICT_KB: case DICT_RESULT: case WORD_LIST:
+        case WORD_DETAIL: case ASK_HOME: case ASK_RESULT: case TRANS_RESULT:
+        case TRANS_KB:
+            if ((int32_t)(now - s_last_activity) > (int32_t)IDLE_SLEEP_MS) {
+                Serial.printf("[MAIN] idle on state %d -> home\n", s_state);
+                s_delete_pending = false;
+                s_scan_done      = false;
+                s_state = IDLE;
+                uiIdle();
+                s_timer = now;
+            }
+            break;
+        default: break;
+    }
+
     switch (s_state) {
 
         // ── IDLE ─────────────────────────────────────────────────────────────
@@ -1790,21 +2132,17 @@ void loop() {
             // loop() tick, before checkTouch() runs) — plain unsigned
             // subtraction then wraps to ~4.29 billion and fires immediately.
             // Confirmed on-device: "[HOME] idle 4294967295ms -> screensaver".
-            static bool s_screensaver_blocked_logged = false;
-            if ((int32_t)(now - s_last_activity) > (int32_t)CLOCK_IDLE_MS && s_rtc_ok) {
-                bool valid = rtc_time_valid();
-                if (valid) {
-                    Serial.printf("[HOME] idle %lums -> screensaver (was page %d)\n",
-                                  (unsigned long)(now - s_last_activity), s_home_page);
-                    s_state = IDLE_CLOCK;
-                    s_timer = now;
-                    s_ui_refresh = 0;  // force an immediate face draw
-                    s_screensaver_blocked_logged = false;
-                    break;
-                } else if (!s_screensaver_blocked_logged) {
-                    Serial.println("[HOME] idle timeout but RTC time not valid — staying on grid");
-                    s_screensaver_blocked_logged = true;
-                }
+            // Character screensaver — no RTC needed, no deep sleep (removed by
+            // request: touch INT sticks LOW so sleep re-woke instantly anyway).
+            // Dim backlight + 80MHz keeps the walk cheap.
+            if ((int32_t)(now - s_last_activity) > (int32_t)CLOCK_IDLE_MS) {
+                Serial.printf("[HOME] idle %lums -> character screensaver (was page %d)\n",
+                              (unsigned long)(now - s_last_activity), s_home_page);
+                s_state = IDLE_CLOCK;
+                s_timer = now;
+                s_ui_refresh = 0;  // signals fresh entry to the animation
+                backlight_set(BL_DIM);
+                break;
             }
             if (tevt == T_TAP && now - s_timer > 400) {
                 s_timer = now;
@@ -1827,7 +2165,7 @@ void loop() {
                             break;
                         case 1: // ── CAMERA ─────────────────────────────────
                             uiStatus("Starting camera...", nullptr, DL_CAM);
-                            { bool cam_ok = cam_init();
+                            { bool cam_ok = cam_begin();
                               s_state = CAMERA_VIEW;
                               uiCamera(cam_ok); }
                             break;
@@ -1837,9 +2175,8 @@ void loop() {
                             uiNotesList();
                             break;
                         case 3: // ── DICT ───────────────────────────────────
-                            s_kb_len = 0; s_kb_input[0] = '\0';
                             s_state = DICT_KB;
-                            uiDictKeyboard();
+                            enterDictKb(0);
                             break;
                     }
                 } else {
@@ -1861,7 +2198,20 @@ void loop() {
                             s_state = WIFI_PANEL;
                             uiWifiPanel(true);
                             break;
-                        default: // reserved slots — no app yet
+                        case 2: // ── TRANSLATE ──────────────────────────────
+                            if (WiFi.status() != WL_CONNECTED) {
+                                uiStatus("WiFi needed", "for Translate", DL_ERR);
+                                delay(1800); uiIdle();
+                            } else if (start_i2s_recording()) {
+                                s_state = TRANS_VOICE;
+                                s_rec_start = s_ui_refresh = now;
+                                uiTransVoice(0);
+                            } else {
+                                uiStatus("Mic failed", nullptr, DL_ERR);
+                                delay(1500); uiIdle();
+                            }
+                            break;
+                        default: // reserved slot — no app yet
                             break;
                     }
                 }
@@ -1885,52 +2235,95 @@ void loop() {
             break;
 
         // ── IDLE_CLOCK ───────────────────────────────────────────────────────
-        // Screensaver — friendly ticking clock face, driven by the PCF8563 RTC.
+        // Screensaver — parallax side-scroller: mascot walks in place while
+        // the warm pixel-art world moves past (sky/hills slow, ground fast).
+        // Each frame is composed into a full-screen PSRAM sprite then pushed
+        // in one blit — no flicker. All pixel data is pre-byte-swapped
+        // RGB565, so the framebuffer is written raw (memcpy / direct stores)
+        // and pushed as-is, same convention as direct pushImage elsewhere.
         case IDLE_CLOCK: {
-            static int      s_clock_min     = -1;
-            static int      s_cur_hour      = 0;
-            static uint32_t s_blink_t       = 0;
-            static uint32_t s_last_rtc_read = 0;
-            static int      s_cur_sec       = 0;
-            static bool     s_rtc_read_ok   = true;   // edge-detect I2C read failures
+            static TFT_eSprite* s_spr    = nullptr;
+            static int      s_bg_off  = 0;   // sky scroll offset (slow layer)
+            static int      s_gnd_off = 0;   // ground scroll offset (fast layer)
+            static int      s_step    = 0;   // walk-cycle step
+            static uint32_t s_anim_t  = 0;
+            static uint32_t s_clk_t   = 0;
+            static char     s_tbuf[8] = {0};
+            const  int GROUND_TOP = 240 - SCENE_GND_H;
+            const  int CHAR_X     = (240 - CHAR_ART_W) / 2 - 10;
+            const  int CHAR_Y     = GROUND_TOP - CHAR_ART_H + 10; // feet in the grass
 
-            // Poll the RTC over I2C at most 5x/sec — no need to hammer it every loop().
-            if (now - s_last_rtc_read >= 200) {
-                s_last_rtc_read = now;
-                int h, m, sec;
-                bool ok = rtc_get_time(h, m, sec);
-                if (ok != s_rtc_read_ok) {
-                    Serial.printf("[CLOCK] rtc_get_time %s\n", ok ? "recovered" : "FAILED (I2C)");
-                    s_rtc_read_ok = ok;
-                }
-                if (ok) {
-                    s_cur_sec = sec;
-                    if (m != s_clock_min || s_ui_refresh == 0) {
-                        Serial.printf("[CLOCK] draw face %02d:%02d\n", h, m);
-                        uiClockFace(h, m);
-                        s_clock_min  = m;
-                        s_cur_hour   = h;
-                        s_ui_refresh = now;
-                        s_blink_t    = now;
+            if (s_ui_refresh == 0) {   // fresh entry — build the compose buffer
+                s_ui_refresh = 1;
+                if (!s_spr) {
+                    s_spr = new TFT_eSprite(&tft);
+                    s_spr->setColorDepth(16);
+                    if (!s_spr->createSprite(240, 240)) {  // 115KB → lands in PSRAM
+                        Serial.println("[SAVER] sprite alloc FAILED — skipping screensaver");
+                        delete s_spr; s_spr = nullptr;
+                        backlight_set(BL_FULL);
+                        s_state = IDLE; s_last_activity = now; s_timer = now;
+                        uiIdle();
+                        break;
                     }
                 }
+                s_anim_t = 0; s_clk_t = 0; s_tbuf[0] = 0;
             }
-            // Center-hub second pulse — cheap "ticking" feel without a full redraw
-            if (now - s_ui_refresh >= 1000) {
-                s_ui_refresh = now;
-                tft.fillCircle(120, 120, 4, (s_cur_sec % 2 == 0) ? DL_INK_FIXED : DL_TEXT3);
+
+            if (s_spr && now - s_anim_t >= 105) {   // ~9.5 fps — relaxed stroll
+                s_anim_t   = now;
+                s_bg_off   = (s_bg_off  + 1) % SCENE_BG_W;
+                s_gnd_off  = (s_gnd_off + 3) % SCENE_GND_W;
+                s_step++;
+
+                uint16_t* fb = (uint16_t*)s_spr->getPointer();
+
+                // Sky + hills — per-row memcpy with horizontal wrap
+                for (int y = 0; y < GROUND_TOP; y++) {
+                    const uint16_t* row = scene_bg + y * SCENE_BG_W;
+                    int first = SCENE_BG_W - s_bg_off; if (first > 240) first = 240;
+                    memcpy(fb + y*240, row + s_bg_off, first * 2);
+                    if (first < 240) memcpy(fb + y*240 + first, row, (240 - first) * 2);
+                }
+                // Ground strip — faster layer
+                for (int y = 0; y < SCENE_GND_H; y++) {
+                    const uint16_t* row = scene_ground + y * SCENE_GND_W;
+                    uint16_t* out = fb + (GROUND_TOP + y) * 240;
+                    int first = SCENE_GND_W - s_gnd_off; if (first > 240) first = 240;
+                    memcpy(out, row + s_gnd_off, first * 2);
+                    if (first < 240) memcpy(out + first, row, (240 - first) * 2);
+                }
+                // Mascot — magenta-keyed blit, 4-frame cycle
+                static const uint16_t* const WALK[4] =
+                    { char_walk_0, char_walk_1, char_walk_2, char_walk_3 };
+                const uint16_t* frame = WALK[s_step & 3];
+                for (int y = 0; y < CHAR_ART_H; y++) {
+                    uint16_t*       out = fb + (CHAR_Y + y) * 240 + CHAR_X;
+                    const uint16_t* in  = frame + y * CHAR_ART_W;
+                    for (int x = 0; x < CHAR_ART_W; x++)
+                        if (in[x] != CHAR_KEY_SW) out[x] = in[x];
+                }
+                // Time up top when RTC is trustworthy (white = swap-invariant)
+                if (s_rtc_ok && (s_clk_t == 0 || now - s_clk_t > 30000)) {
+                    s_clk_t = now;
+                    int h, m, sec;
+                    if (rtc_get_time(h, m, sec) && rtc_time_valid())
+                        snprintf(s_tbuf, sizeof(s_tbuf), "%02d:%02d", h, m);
+                    else s_tbuf[0] = 0;
+                }
+                if (s_tbuf[0]) {
+                    s_spr->setTextColor(0xFFFF);
+                    s_spr->drawCentreString(s_tbuf, 120, 16, 2);
+                }
+
+                s_spr->pushSprite(0, 0);
             }
-            // Occasional blink for personality
-            if (now - s_blink_t > 4000) {
-                s_blink_t = now;
-                uiClockBlink(true, s_cur_hour, s_clock_min);
-                delay(160);
-                uiClockBlink(false, s_cur_hour, s_clock_min);
-            }
+
             if (tevt == T_TAP || tevt == T_SWIPE_LEFT || tevt == T_SWIPE_RIGHT ||
                 tevt == T_SWIPE_UP || tevt == T_SWIPE_DOWN) {
                 Serial.println("[CLOCK] touch -> exit screensaver");
-                s_clock_min = -1;  // force a full redraw next time we enter
+                if (s_spr) { s_spr->deleteSprite(); delete s_spr; s_spr = nullptr; }
+                backlight_set(BL_FULL);
                 s_state = IDLE;
                 s_last_activity = now;
                 s_timer = now;
@@ -1941,6 +2334,15 @@ void loop() {
 
         // ── RECORDING ────────────────────────────────────────────────────────
         case RECORDING:
+            // Mic task auto-stops itself at the 20s buffer cap — without this
+            // check the ring sits full and the timer keeps counting dead air.
+            if (now - s_rec_start > 500 && !is_recording()) {
+                Serial.println("[MAIN] Mic hit 20s cap — auto-stopping UI.");
+                uiStatus("Stopping...", nullptr, DL_WARN);
+                s_state = WAITING_STOP;
+                s_timer = now;
+                break;
+            }
             if (now - s_ui_refresh > 1000) {
                 s_ui_refresh = now;
                 uiRecording(now - s_rec_start);
@@ -1977,6 +2379,7 @@ void loop() {
 
         // ── TRANSCRIBING ─────────────────────────────────────────────────────
         case TRANSCRIBING: {
+            cpu_fast();  // TLS upload is ~3x quicker at 240MHz
             memset(s_transcript, 0, sizeof(s_transcript));
             bool ok = deepgram_transcribe(
                 get_audio_buffer(), get_audio_buffer_size(),
@@ -2007,6 +2410,7 @@ void loop() {
                 uiStatus("Saved for retry", "will upload later", DL_WARN);
                 delay(2500); uiIdle(); s_state = IDLE;
             }
+            cpu_norm();
             s_timer = millis();
             break;
         }
@@ -2076,8 +2480,13 @@ void loop() {
                 int tap_y = (int)s_swipe_start_y;
 
                 if (s_delete_pending) {
-                    // Any tap confirms when overlay is showing
                     s_delete_pending = false;
+                    if (!tapInDeleteBox(tap_x, tap_y)) {
+                        // Tap outside the box = cancel, redraw the note
+                        uiNoteDetail(s_detail_rank, s_transcript, s_detail_scroll);
+                        s_timer = now;
+                        break;
+                    }
                     sd_reinit(tft.getSPIinstance());
                     delete_note(s_detail_rank);
                     sd_release();
@@ -2220,14 +2629,14 @@ void loop() {
             }
             else if (tevt == T_SWIPE_RIGHT) {
                 // Back to IDLE
-                cam_deinit();
+                cam_end();
                 s_state = IDLE;
                 uiIdle();
                 s_timer = now;
             }
             else if (tevt == T_SWIPE_LEFT && s_photo_count > 0) {
                 // Photo gallery
-                cam_deinit();
+                cam_end();
                 s_scroll_top = 0;
                 s_state = PHOTO_GALLERY;
                 uiPhotoGallery(s_scroll_top);
@@ -2253,7 +2662,7 @@ void loop() {
                 int tap_y = (int)s_swipe_start_y;
                 if (tap_y < 25) {
                     // Header → back to camera
-                    bool cam_ok = cam_init();
+                    bool cam_ok = cam_begin();
                     s_state = CAMERA_VIEW;
                     uiCamera(cam_ok);
                 } else {
@@ -2277,7 +2686,7 @@ void loop() {
             }
             else if (tevt == T_SWIPE_RIGHT) {
                 // Back to camera screen
-                bool cam_ok = cam_init();
+                bool cam_ok = cam_begin();
                 s_state = CAMERA_VIEW;
                 uiCamera(cam_ok);
                 s_timer = now;
@@ -2293,8 +2702,15 @@ void loop() {
                 int tap_y = (int)s_swipe_start_y;
 
                 if (s_delete_pending) {
-                    // Any tap confirms when overlay is showing
                     s_delete_pending = false;
+                    if (!tapInDeleteBox(tap_x, tap_y)) {
+                        // Tap outside the box = cancel, redraw the photo
+                        uiPhotoLoading(s_detail_rank);
+                        cam_view_photo(tft.getSPIinstance(), s_detail_rank);
+                        uiPhotoDetailOverlay(s_detail_rank, s_photo_count);
+                        s_timer = now;
+                        break;
+                    }
                     sd_reinit(tft.getSPIinstance());
                     delete_photo(s_detail_rank);
                     sd_release();
@@ -2356,6 +2772,9 @@ void loop() {
             // On entry: do one scan then display results
             if (!s_scan_done) {
                 Serial.println("[WiFi] Scanning...");
+                // A pending connect attempt blocks scanning (returns -2) —
+                // kill it first unless we're actually connected.
+                if (WiFi.status() != WL_CONNECTED) { WiFi.disconnect(); delay(100); }
                 WiFi.scanDelete(); // clear any stale scan results
                 int n = WiFi.scanNetworks(false, false); // blocking scan
                 Serial.printf("[WiFi] Raw scan: %d total networks\n", n);
@@ -2396,10 +2815,14 @@ void loop() {
             else if (tevt == T_TAP) {
                 int tap_y = (int)s_swipe_start_y;
                 if (tap_y < 26) {
-                    // Tap header → close
+                    // Tap header → close — redraw whichever screen we return to
                     s_state = s_prev_state;
                     s_scan_done = false;
-                    uiIdle();
+                    switch (s_prev_state) {
+                        case LIST_VIEW:     uiNotesList();                break;
+                        case PHOTO_GALLERY: uiPhotoGallery(s_scroll_top); break;
+                        default:            uiIdle();                     break;
+                    }
                     s_timer = now;
                 } else {
                     // Mirror uiWifiPanel layout exactly: SAVED_COUNT order, variable height
@@ -2429,9 +2852,13 @@ void loop() {
                         while (WiFi.status() != WL_CONNECTED && millis()-t < 12000) delay(300);
                         if (WiFi.status() == WL_CONNECTED) {
                             s_wifi_ok = true;
+                            WiFi.setAutoReconnect(true);
+                            strncpy(s_rtc_ssid, SAVED_SSIDS[tapped_idx], 32); s_rtc_ssid[32] = '\0';
+                            strncpy(s_rtc_pass, SAVED_PASS[tapped_idx],  64); s_rtc_pass[64] = '\0';
                             Serial.printf("[WiFi] Connected: %s\n", WiFi.localIP().toString().c_str());
                         } else {
                             s_wifi_ok = false;
+                            WiFi.disconnect();  // stop background retry storm
                             Serial.println("[WiFi] Failed");
                         }
                         uiWifiPanel(false);
@@ -2466,27 +2893,35 @@ void loop() {
             if (tevt == T_TAP) {
                 int action = kb_tap((int)s_swipe_last_x, (int)s_swipe_start_y);
                 if (action == 1) {
-                    // Redraw keyboard with updated input
-                    uiDictKeyboard();
+                    // Input changed — refresh only input bar + suggestions,
+                    // full-keyboard redraw flickered on every keypress
+                    fetchSuggestions();
+                    uiDictKbTop();
                     s_timer = now;
-                } else if (action == 2) {
-                    // GO / Search
-                    if (s_kb_len > 0) {
-                        uiStatus("Looking up...", s_kb_input, DL_DIC);
-                        char word_buf[48];
-                        strncpy(word_buf, s_kb_input, 47); word_buf[47] = '\0';
-                        bool found = dict_lookup(word_buf, s_transcript, sizeof(s_transcript)-1);
-                        if (found) {
-                            // Auto-save to vocabulary
-                            sd_reinit(tft.getSPIinstance());
-                            saveWord(s_transcript);
-                            sd_release();
-                            s_detail_rank = 0; // new word is newest
-                        }
-                        uiDictResult(s_transcript, found, found ? 0 : -1, s_word_count);
-                        s_state = DICT_RESULT;
-                        s_timer = now;
+                } else if (action >= 4 || action == 2) {
+                    // GO with typed word, or a suggestion pill = instant lookup
+                    char word_buf[48];
+                    if (action >= 4) {
+                        strncpy(word_buf, s_suggest[action - 4], 47);
+                    } else {
+                        if (s_kb_len == 0) break;
+                        strncpy(word_buf, s_kb_input, 47);
                     }
+                    word_buf[47] = '\0';
+                    uiStatus("Looking up...", word_buf, DL_DIC);
+                    cpu_fast();  // lookup may hit MW/LLM over TLS
+                    bool found = dict_lookup(word_buf, s_transcript, sizeof(s_transcript)-1);
+                    cpu_norm();
+                    if (found) {
+                        // Auto-save to vocabulary
+                        sd_reinit(tft.getSPIinstance());
+                        saveWord(s_transcript);
+                        sd_release();
+                        s_detail_rank = 0; // new word is newest
+                    }
+                    uiDictResult(s_transcript, found, found ? 0 : -1, s_word_count);
+                    s_state = DICT_RESULT;
+                    s_timer = now;
                 } else if (action == 3) {
                     // MIC key → voice input mode
                     if (start_i2s_recording()) {
@@ -2516,6 +2951,7 @@ void loop() {
         // ── DICT_FETCH ────────────────────────────────────────────────────────
         case DICT_FETCH:
             if (!is_recording()) {
+                cpu_fast();  // transcribe + lookup over TLS
                 memset(s_transcript, 0, sizeof(s_transcript));
                 bool ok = deepgram_transcribe(
                     get_audio_buffer(), get_audio_buffer_size(),
@@ -2536,6 +2972,7 @@ void loop() {
                 } else {
                     uiDictResult("", false, -1, 0);
                 }
+                cpu_norm();
                 s_state = DICT_RESULT;
                 s_timer = now;
             }
@@ -2545,9 +2982,8 @@ void loop() {
         case DICT_RESULT:
             if (now - s_timer < 500) break;
             if (tevt == T_TAP) {
-                s_kb_len = 0; s_kb_input[0] = '\0';
                 s_state = DICT_KB;
-                uiDictKeyboard();
+                enterDictKb(0);
                 s_timer = now;
             }
             // Swipe LEFT → older saved word (rank increases = further back in history)
@@ -2570,9 +3006,8 @@ void loop() {
             }
             // Swipe RIGHT at newest (rank 0) → back to keyboard
             else if (tevt == T_SWIPE_RIGHT) {
-                s_kb_len = 0; s_kb_input[0] = '\0';
                 s_state = DICT_KB;
-                uiDictKeyboard();
+                enterDictKb(0);
                 s_timer = now;
             }
             else if (tevt == T_SWIPE_UP && s_word_count > 0) {
@@ -2598,8 +3033,7 @@ void loop() {
             }
             else if (tevt == T_SWIPE_RIGHT) {
                 s_state = DICT_KB;
-                s_kb_len = 0; s_kb_input[0] = '\0';
-                uiDictKeyboard();
+                enterDictKb(0);
                 s_timer = now;
             }
             else if (tevt == T_TAP) {
@@ -2616,8 +3050,7 @@ void loop() {
                     s_state = WORD_DETAIL;
                 } else if (tap_y < 25) {
                     s_state = DICT_KB;
-                    s_kb_len = 0; s_kb_input[0] = '\0';
-                    uiDictKeyboard();
+                    enterDictKb(0);
                 }
                 s_timer = now;
             }
@@ -2630,15 +3063,19 @@ void loop() {
                 int tap_x = (int)s_swipe_last_x;
                 int tap_y = (int)s_swipe_start_y;
                 if (s_delete_pending) {
-                    // Any tap confirms when overlay is showing
                     s_delete_pending = false;
+                    if (!tapInDeleteBox(tap_x, tap_y)) {
+                        // Tap outside the box = cancel, redraw the word
+                        uiWordDetail(s_detail_rank, s_transcript, s_detail_scroll);
+                        s_timer = now;
+                        break;
+                    }
                     sd_reinit(tft.getSPIinstance());
                     delete_word(s_detail_rank);
                     sd_release();
                     if (s_word_count == 0) {
                         s_state = DICT_KB;
-                        s_kb_len = 0; s_kb_input[0] = '\0';
-                        uiDictKeyboard();
+                        enterDictKb(0);
                     } else {
                         if (s_detail_rank >= s_word_count) s_detail_rank = s_word_count-1;
                         s_state = WORD_LIST;
@@ -2685,7 +3122,7 @@ void loop() {
                 if (tap_y < 115) {
                     // Photo + Voice — start camera preview
                     uiStatus("Starting camera...", nullptr, DL_ASK);
-                    if (cam_init()) {
+                    if (cam_begin()) {
                         s_state = ASK_CAM;
                     } else {
                         uiStatus("Camera failed", nullptr, DL_ERR);
@@ -2724,7 +3161,7 @@ void loop() {
             if (tevt == T_TAP) {
                 uiStatus("Capturing...", nullptr, DL_ASK);
                 cam_capture_to_mem(&s_ask_jpeg, &s_ask_jpg_sz);
-                cam_deinit();
+                cam_end();
                 s_ask_has_photo = (s_ask_jpeg != nullptr);
                 if (start_i2s_recording()) {
                     s_state = ASK_VOICE;
@@ -2737,7 +3174,7 @@ void loop() {
                 }
                 s_timer = now;
             } else if (tevt == T_SWIPE_RIGHT) {
-                cam_deinit();
+                cam_end();
                 s_state = ASK_HOME; uiAskHome(); s_timer = now;
             }
             break;
@@ -2761,6 +3198,7 @@ void loop() {
         // Blocking state: wait for I2S to drain, then transcribe + ask AI + save
         case ASK_THINK:
             if (!is_recording()) {
+                cpu_fast();  // transcribe + AI call over TLS
                 // Step 1: transcribe voice question
                 memset(s_transcript, 0, sizeof(s_transcript));
                 bool ok = deepgram_transcribe(
@@ -2769,11 +3207,13 @@ void loop() {
 
                 if (!ok) {
                     if (s_ask_jpeg) { free(s_ask_jpeg); s_ask_jpeg = nullptr; s_ask_has_photo = false; }
+                    cpu_norm();
                     uiStatus("Upload failed", "need faster WiFi", DL_ERR);
                     delay(2500); s_state = IDLE; uiIdle(); s_timer = millis(); break;
                 }
                 if (strlen(s_transcript) == 0) {
                     if (s_ask_jpeg) { free(s_ask_jpeg); s_ask_jpeg = nullptr; s_ask_has_photo = false; }
+                    cpu_norm();
                     uiStatus("Didn't catch that", "speak louder & closer", DL_ERR);
                     delay(2500); s_state = IDLE; uiIdle(); s_timer = millis(); break;
                 }
@@ -2815,6 +3255,7 @@ void loop() {
                 strncpy(s_previews[0], note_buf, PREVIEW_CHARS);
                 s_previews[0][PREVIEW_CHARS] = '\0';
                 sd_release();
+                cpu_norm();
 
                 s_ask_scroll = 0;
                 s_state = ASK_RESULT;
@@ -2836,6 +3277,133 @@ void loop() {
                 s_ask_scroll--;
                 uiAskResult(s_ask_result, true);
                 s_timer = now;
+            }
+            break;
+
+        // ── TRANS_VOICE ───────────────────────────────────────────────────────
+        case TRANS_VOICE:
+            if (now - s_ui_refresh > 800) {
+                s_ui_refresh = now;
+                uiTransVoice(now - s_rec_start);
+            }
+            if (tevt == T_SWIPE_UP) {
+                // User wants to type instead — discard this recording
+                stop_i2s_recording();
+                s_state = TRANS_KB;
+                enterDictKb(1);
+                s_timer = now;
+                break;
+            }
+            if (tevt == T_SWIPE_RIGHT) {
+                stop_i2s_recording();
+                s_state = IDLE; uiIdle(); s_timer = now;
+                break;
+            }
+            // Auto-stop at 10s, or tap
+            if ((tevt == T_TAP && now - s_timer > 1000) || (now - s_rec_start > 10000)) {
+                stop_i2s_recording();
+                uiStatus("Translating...", "transcribing...", DL_WIFI);
+                s_state = TRANS_THINK;
+                s_timer = now;
+            }
+            break;
+
+        // ── TRANS_THINK ───────────────────────────────────────────────────────
+        case TRANS_THINK:
+            if (!is_recording()) {
+                cpu_fast();  // transcribe over TLS
+                memset(s_transcript, 0, sizeof(s_transcript));
+                bool ok = deepgram_transcribe(
+                    get_audio_buffer(), get_audio_buffer_size(),
+                    s_transcript, sizeof(s_transcript) - 1);
+                cpu_norm();
+                if (!ok || strlen(s_transcript) == 0) {
+                    uiStatus("Didn't catch that", "speak louder & closer", DL_ERR);
+                    delay(2000);
+                    s_state = IDLE; uiIdle(); s_timer = millis();
+                    break;
+                }
+                Serial.printf("[TRANS] Heard: %s\n", s_transcript);
+                if (doTranslate(s_transcript)) {
+                    s_state = TRANS_RESULT;
+                    uiTransResult();
+                } else {
+                    // Usually the free AI models rate-limiting, not the network
+                    uiStatus("AI busy right now", "tap tile to try again", DL_ERR);
+                    delay(2200);
+                    s_state = IDLE; uiIdle();
+                }
+                s_timer = millis();
+            }
+            break;
+
+        // ── TRANS_RESULT ──────────────────────────────────────────────────────
+        case TRANS_RESULT:
+            if (now - s_timer < 400) break;
+            if (tevt == T_TAP) {
+                // Again — straight back to voice input
+                if (start_i2s_recording()) {
+                    s_state = TRANS_VOICE;
+                    s_rec_start = s_ui_refresh = now;
+                    uiTransVoice(0);
+                }
+                s_timer = now;
+            } else if (tevt == T_SWIPE_RIGHT) {
+                s_state = IDLE; uiIdle(); s_timer = now;
+            } else if (tevt == T_SWIPE_UP) {
+                s_trans_scroll++;
+                uiTransResult();
+                s_timer = now;
+            } else if (tevt == T_SWIPE_DOWN && s_trans_scroll > 0) {
+                s_trans_scroll--;
+                uiTransResult();
+                s_timer = now;
+            }
+            break;
+
+        // ── TRANS_KB ──────────────────────────────────────────────────────────
+        // Same keyboard as DICT_KB, translate behavior: GO translates the
+        // whole input, suggestions complete the current word, MIC = voice.
+        case TRANS_KB:
+            if (now - s_timer < 150) break;
+            if (tevt == T_SWIPE_DOWN) {
+                s_state = IDLE; uiIdle(); s_timer = now; break;
+            }
+            if (tevt == T_TAP) {
+                int action = kb_tap((int)s_swipe_last_x, (int)s_swipe_start_y);
+                if (action == 1) {
+                    fetchSuggestions();
+                    uiDictKbTop();
+                    s_timer = now;
+                } else if (action >= 4) {
+                    acceptSuggestion(action - 4);
+                    fetchSuggestions();  // trailing space → clears the row
+                    uiDictKbTop();
+                    s_timer = now;
+                } else if (action == 2 && s_kb_len > 0) {
+                    char english[64];
+                    int k = 0;
+                    for (int i = 0; s_kb_input[i] && k < 63; i++)
+                        english[k++] = tolower(s_kb_input[i]);
+                    english[k] = '\0';
+                    if (doTranslate(english)) {
+                        s_state = TRANS_RESULT;
+                        uiTransResult();
+                    } else {
+                        // Usually the free AI models rate-limiting, not the network
+                        uiStatus("AI busy right now", "try again shortly", DL_ERR);
+                        delay(2200);
+                        uiDictKeyboard();
+                    }
+                    s_timer = now;
+                } else if (action == 3) {
+                    if (start_i2s_recording()) {
+                        s_state = TRANS_VOICE;
+                        s_rec_start = s_ui_refresh = now;
+                        uiTransVoice(0);
+                        s_timer = now;
+                    }
+                }
             }
             break;
     }
